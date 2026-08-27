@@ -23,3 +23,31 @@ python -m gello_remote.client --url http://127.0.0.1:18000
 
 The remote service returns suggestions only. Joint limits, velocity limits,
 watchdogs, and emergency stop must remain on the robot-side machine.
+
+## Simulation-first Franka backend
+
+`MockFrankaBackend` is the default backend for tests and transport development.
+Every backend call accepts exactly seven finite arm-joint targets; invalid input
+is rejected before any backend state is changed.
+
+```python
+from gello_remote.backends import MockFrankaBackend
+
+backend = MockFrankaBackend()
+backend.set_joint_targets([0.0] * 7)
+```
+
+An optional bounded Isaac Lab smoke test uses the installed Franka asset and
+the Isaac Lab 6.1.11 APIs. Isaac Lab imports are lazy, so ordinary imports and
+unit tests do not require the simulator environment. Run it headlessly with:
+
+```bash
+conda run -n isaaclab env CUDA_VISIBLE_DEVICES=0 \
+  PYTHONPATH=/data/zhanghejun/gello-remote/src \
+  /data/zhanghejun/IsaacLab/isaaclab.sh -p -m gello_remote.isaaclab_smoke \
+  --steps 10 --device cuda:0 --viz none
+```
+
+The smoke process creates one simulated Franka, holds its default seven arm
+joints for a bounded number of physics steps, and exits. It does not expose a
+real-robot adapter, connect to robot hardware, or change the existing HTTP API.
