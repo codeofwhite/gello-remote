@@ -42,8 +42,8 @@ the Isaac Lab 6.1.11 APIs. Isaac Lab imports are lazy, so ordinary imports and
 unit tests do not require the simulator environment. Run it headlessly with:
 
 ```bash
-conda run -n isaaclab env CUDA_VISIBLE_DEVICES=0 \
-  PYTHONPATH=/data/zhanghejun/gello-remote/src \
+env CONDA_PREFIX=/home/zhanghejun/miniconda3/envs/isaaclab \
+  CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/data/zhanghejun/gello-remote/src \
   /data/zhanghejun/IsaacLab/isaaclab.sh -p -m gello_remote.isaaclab_smoke \
   --steps 10 --device cuda:0 --viz none
 ```
