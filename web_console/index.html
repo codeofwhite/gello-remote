@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>GELLO → Isaac Sim</title>
+  </head>
+  <body>
+    <main class="console-shell">
+      <section class="viewport-panel" aria-label="Isaac Sim video">
+        <header class="top-bar">
+          <div>
+            <strong>Browser Teleoperation Console</strong>
+            <span class="engine-badge">Isaac Sim</span>
+          </div>
+          <span id="stream-status" class="status status-connecting">Connecting</span>
+        </header>
+        <div id="stream-surface" class="stream-surface">
+          <div id="main-div" class="stream-frame" hidden>
+            <div id="aspect-ratio-div" tabindex="0">
+              <video id="remote-video" muted autoplay playsinline></video>
+              <audio id="remote-audio" muted></audio>
+            </div>
+          </div>
+          <div id="stream-overlay" class="stream-overlay">
+            <strong id="stream-message">Connecting to Isaac Sim WebRTC…</strong>
+            <span id="stream-detail">Waiting for runtime configuration.</span>
+          </div>
+        </div>
+        <footer class="video-footer">
+          <span id="stream-endpoint">WebRTC: waiting</span>
+          <span id="video-dimensions">Video: 0×0</span>
+        </footer>
+      </section>
+
+      <aside class="control-panel" aria-label="GELLO controls">
+        <section class="panel-section">
+          <h1>GELLO → Franka</h1>
+          <p>Direct 7-DOF joint targets with independent gripper control.</p>
+          <div class="button-row">
+            <button id="serial-connect">Connect GELLO</button>
+            <button id="serial-disconnect" disabled>Disconnect</button>
+          </div>
+          <div id="serial-status" class="status-text">Web Serial idle — use desktop Chrome/Edge on localhost.</div>
+        </section>
+
+        <section class="panel-section">
+          <h2>Calibration</h2>
+          <div class="button-grid">
+            <button id="capture-home" disabled>Capture arm home</button>
+            <button id="capture-open" disabled>Capture gripper open</button>
+            <button id="capture-closed" disabled>Capture gripper closed</button>
+          </div>
+          <div class="directions">
+            <label>J1 <select data-direction><option value="1">+1</option><option value="-1">−1</option></select></label>
+            <label>J2 <select data-direction><option value="1">+1</option><option value="-1">−1</option></select></label>
+            <label>J3 <select data-direction><option value="1">+1</option><option value="-1">−1</option></select></label>
+            <label>J4 <select data-direction><option value="1">+1</option><option value="-1">−1</option></select></label>
+            <label>J5 <select data-direction><option value="1">+1</option><option value="-1">−1</option></select></label>
+            <label>J6 <select data-direction><option value="1">+1</option><option value="-1">−1</option></select></label>
+            <label>J7 <select data-direction><option value="1">+1</option><option value="-1">−1</option></select></label>
+          </div>
+          <label class="enable-row"><input id="enable-control" type="checkbox" disabled /> Enable control</label>
+          <div id="raw" class="raw-values">Raw ID 1–8: waiting</div>
+        </section>
+
+        <section class="panel-section telemetry-section">
+          <h2>Episode recording</h2>
+          <label class="task-field">
+            Task instruction
+            <input id="episode-task" value="Move the Franka safely with GELLO" />
+          </label>
+          <div class="button-grid">
+            <button id="record-start">Start Episode</button>
+            <button id="record-success" disabled>Save Success</button>
+            <button id="record-failure" disabled>Save Failure</button>
+            <button id="record-discard" disabled>Discard</button>
+            <button id="environment-reset">Reset</button>
+          </div>
+          <div id="recording-status" class="status-text">Recording: idle</div>
+        </section>
+
+        <section class="panel-section telemetry-section">
+          <h2>Runtime status</h2>
+          <div id="sim-status" class="status-text">Simulator WebSocket: connecting…</div>
+          <div id="telemetry" class="status-text">Telemetry: waiting</div>
+        </section>
+      </aside>
+    </main>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

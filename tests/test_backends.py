@@ -33,37 +33,55 @@ def test_mock_backend_stores_an_immutable_copy() -> None:
     assert backend.last_joint_targets == (0.1,) * 7
 
 
+def test_mock_backend_tracks_independent_gripper_command() -> None:
+    backend = MockFrankaBackend()
+    backend.set_command([0.2] * 7, gripper_closed=True)
+    assert backend.last_joint_targets == (0.2,) * 7
+    assert backend.last_gripper_closed is True
+
+
 def test_isaaclab_smoke_module_imports_without_isaaclab() -> None:
     module = importlib.import_module("gello_remote.isaaclab_smoke")
     assert callable(module.main)
 
 
-def test_isaaclab_backend_uses_seven_ordered_arm_joints(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_isaaclab_gello_module_imports_without_isaaclab_or_websockets() -> None:
+    module = importlib.import_module("gello_remote.isaaclab_gello")
+    assert callable(module.main)
+
+
+def test_isaaclab_backend_uses_ordered_arm_and_finger_joints(monkeypatch: pytest.MonkeyPatch) -> None:
     tensor_calls: list[tuple[object, object, str]] = []
+    full_calls: list[tuple[tuple[int, int], float, object, str]] = []
     fake_torch = SimpleNamespace(
         float32="float32",
         tensor=lambda values, *, dtype, device: tensor_calls.append((values, dtype, device)) or "tensor",
+        full=lambda shape, value, *, dtype, device: full_calls.append((shape, value, dtype, device)) or "fingers",
     )
     monkeypatch.setitem(__import__("sys").modules, "torch", fake_torch)
 
     class FakeArticulation:
-        target_call: tuple[object, list[int]] | None = None
+        target_calls: list[tuple[object, list[int]]] = []
         writes = 0
 
-        def find_joints(self, names: list[str], *, preserve_order: bool) -> tuple[list[int], list[str]]:
+        def find_joints(self, names: list[str] | str, *, preserve_order: bool) -> tuple[list[int], list[str]]:
             assert preserve_order is True
-            return list(range(7)), names
+            if isinstance(names, list):
+                return list(range(7)), names
+            assert names == "panda_finger_joint.*"
+            return [7, 8], ["panda_finger_joint1", "panda_finger_joint2"]
 
         def set_joint_position_target_index(self, *, target: object, joint_ids: list[int]) -> None:
-            self.target_call = (target, joint_ids)
+            self.target_calls.append((target, joint_ids))
 
         def write_data_to_sim(self) -> None:
             self.writes += 1
 
     articulation = FakeArticulation()
     backend = IsaacLabFrankaBackend(articulation, device="cuda:3")
-    backend.set_joint_targets([0.25] * 7)
+    backend.set_command([0.25] * 7, gripper_closed=True)
 
     assert tensor_calls == [([(0.25,) * 7], "float32", "cuda:3")]
-    assert articulation.target_call == ("tensor", list(range(7)))
+    assert full_calls == [((1, 2), 0.0, "float32", "cuda:3")]
+    assert articulation.target_calls == [("tensor", list(range(7))), ("fingers", [7, 8])]
     assert articulation.writes == 1

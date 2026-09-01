@@ -1,0 +1,21 @@
+{
+  "name": "gello-isaac-web-console",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "vite build",
+    "dev": "vite --host 127.0.0.1 --port 8210",
+    "test": "node --test tests/*.test.mjs"
+  },
+  "dependencies": {
+    "@nvidia/omniverse-webrtc-streaming-library": "5.17.0"
+  },
+  "devDependencies": {
+    "vite": "6.4.3"
+  },
+  "engines": {
+    "node": ">=20.0.0",
+    "npm": ">=10.0.0"
+  }
+}

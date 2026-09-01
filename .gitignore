@@ -5,3 +5,6 @@ __pycache__/
 .env
 checkpoints/
 data/
+web_console/node_modules/
+*.etli
+*.egg-info/
