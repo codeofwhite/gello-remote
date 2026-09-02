@@ -20,15 +20,14 @@ from gello_remote.protocol import GelloCommandV1
 
 from franka_only.control import BrowserKeyboardControlSource
 from franka_only.camera_profiles import load_camera_profile
-from franka_only.dataset_schema import CONTROL_SOURCE_IDS
-from franka_only.recording import RawEpisodeRecorder
+from robot_data_contracts import FrankaEpisodeWriter
 from franka_only.scene_registry import (
     SCENE_IDS,
     apply_scene_overrides,
     scene_catalog,
     scene_parameter_schema,
 )
-from franka_only.scenes import build_scene
+from franka_only.scenes import build_scene, validate_control_timing
 
 
 PROJECT_ROOT = Path(franka_only.__file__).resolve().parents[1]
@@ -54,6 +53,21 @@ STATIC_ASSETS = {
 def parse_gello_message(data: dict) -> GelloCommandV1:
     """Validate one versioned command using the canonical gello-remote contract."""
     return GelloCommandV1.model_validate(data)
+
+
+def parse_keyboard_event(data: dict, *, last_sequence: int | None) -> tuple[int, int]:
+    """Validate browser keyboard ordering and its wall-clock source timestamp."""
+    sequence = data.get("sequence")
+    timestamp_ns = data.get("timestamp_ns")
+    if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 0:
+        raise ValueError("Keyboard sequence must be a non-negative integer")
+    if isinstance(timestamp_ns, bool) or not isinstance(timestamp_ns, int) or timestamp_ns <= 0:
+        raise ValueError("Keyboard timestamp_ns must be a positive integer")
+    if last_sequence is not None and sequence <= last_sequence:
+        raise ValueError(
+            f"Keyboard sequence must increase within one connection: {sequence} <= {last_sequence}"
+        )
+    return sequence, timestamp_ns
 
 
 def control_message_allowed(control_source: str, message_type: str) -> bool:
@@ -107,6 +121,8 @@ def build_restart_argv(
         str(args.sim_dt),
         "--substeps",
         str(args.substeps),
+        "--seed",
+        str(args.seed),
         "--width",
         str(args.width),
         "--height",
@@ -154,25 +170,40 @@ class TeleopServer:
         self.gello_watchdog_holds = 0
         self.gello_session_gate = GelloSessionGate(args.gello_timeout)
         self._watchdog_holding = False
-        gs.init(backend=gs.gpu, precision="32", logging_level=args.logging_level)
+        self.keyboard_sequence: int | None = None
+        self.keyboard_timestamp_ns: int | None = None
+        self.keyboard_receive_timestamp_ns: int | None = None
+        gs.init(backend=gs.gpu, precision="32", logging_level=args.logging_level, seed=args.seed)
         self.task_scene = build_scene(args.scene, args, args.scene_overrides)
         geometry_metadata = self.task_scene.geometry_metadata()
-        self.recorder = RawEpisodeRecorder(
+        control_source = (
+            "browser_keyboard" if args.control_source == "keyboard" else "gello_joint_targets"
+        )
+        operator_command_names = (
+            ["dx_m", "dy_m", "dz_m", "droll_rad", "dpitch_rad", "dyaw_rad", "gripper_m"]
+            if args.control_source == "keyboard"
+            else [f"requested_joint_position/panda_joint{i}_rad" for i in range(1, 8)]
+        )
+        self.recorder = FrankaEpisodeWriter(
             args.data_dir,
             fps=args.control_fps,
+            engine_id="genesis",
+            engine_version=getattr(gs, "__version__", "unknown"),
+            scene_id=self.task_scene.scene_id,
+            seed=args.seed,
+            worker_id="gello_remote_genesis",
+            control_source=control_source,
             state_names=self.task_scene.state_names,
             action_names=self.task_scene.action_names,
-            operator_command_names=self.task_scene.operator_command_names,
+            operator_command_names=operator_command_names,
             camera_names=self.task_scene.camera_names,
             run_metadata={
-                "scene_id": self.task_scene.scene_id,
                 "robot": "Genesis built-in Franka Panda with original parallel gripper",
                 "object_assets": (
                     "Genesis built-in cloth.obj with PBD material"
                     if args.scene == "cloth_corner_lift"
                     else "Genesis primitives defined by SceneSpec"
                 ),
-                "genesis_version": getattr(gs, "__version__", "unknown"),
                 "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", "unset"),
                 "sim_dt_s": args.sim_dt,
                 "substeps": args.substeps,
@@ -184,9 +215,7 @@ class TeleopServer:
                 "scene_geometry": geometry_metadata,
                 "action_bounds": geometry_metadata["action_bounds"],
                 "resolved_scene_spec": self.task_scene.resolved_scene_spec(),
-                "control_source": (
-                    "browser_keyboard" if args.control_source == "keyboard" else "gello_joint_targets"
-                ),
+                "control_source": control_source,
                 "control_source_options": ["browser_keyboard", "gello_joint_targets"],
                 "operator_command_layouts": {
                     "browser_keyboard": [
@@ -194,6 +223,9 @@ class TeleopServer:
                     ],
                     "gello_joint_targets": [f"panda_joint{i}_rad" for i in range(1, 8)],
                 },
+                "git_roots": {"gello_remote": Path(gello_remote.__file__).resolve().parents[2],
+                              "clothtwin": PROJECT_ROOT},
+                "dependency_packages": ["genesis-world", "numpy", "opencv-python"],
             },
         )
 
@@ -209,6 +241,10 @@ class TeleopServer:
         if self.recorder.is_recording:
             raise RuntimeError("An episode is already recording")
         self.reset()
+        if self.args.control_source == "keyboard" and self.keyboard_sequence is None:
+            self.keyboard_sequence = 0
+            self.keyboard_timestamp_ns = time.time_ns()
+            self.keyboard_receive_timestamp_ns = time.monotonic_ns()
         self.current_episode = self.recorder.start(task)
         self.current_task = task.strip()
         return f"Episode {self.current_episode} started"
@@ -243,6 +279,16 @@ class TeleopServer:
         if code == "Backspace" and self.recorder.is_recording:
             return self.discard()
         return self.control.keydown(code)
+
+    def record_keyboard_event(
+        self, sequence: int, timestamp_ns: int, *, received_at_ns: int | None = None
+    ) -> None:
+        """Store the latest browser event provenance used by held keyboard commands."""
+        self.keyboard_sequence = sequence
+        self.keyboard_timestamp_ns = timestamp_ns
+        self.keyboard_receive_timestamp_ns = (
+            time.monotonic_ns() if received_at_ns is None else received_at_ns
+        )
 
     def handle_command(self, command: str, task: str) -> str:
         if command == "start":
@@ -304,15 +350,28 @@ class TeleopServer:
         )
         if self.args.control_source == "keyboard":
             sample = self.control.sample()
-            action, operator_command = self.task_scene.prepare_action(sample)
-            control_sequence = -1
-            control_timestamp_ns = -1
+            requested_action, action, operator_command = self.task_scene.prepare_action_stages(sample)
+            control_sequence = int(self.keyboard_sequence) if self.keyboard_sequence is not None else -1
+            control_timestamp_ns = (
+                int(self.keyboard_timestamp_ns) if self.keyboard_timestamp_ns is not None else -1
+            )
+            control_receive_timestamp_ns = (
+                int(self.keyboard_receive_timestamp_ns)
+                if self.keyboard_receive_timestamp_ns is not None
+                else -1
+            )
         elif gello_fresh:
             action, operator_command = self.task_scene.prepare_joint_action(
                 self.gello_joint_targets, self.gello_gripper_closed
             )
+            operator_command = self.gello_joint_targets.copy()
             control_sequence = int(self.gello_sequence)
             control_timestamp_ns = int(self.gello_timestamp_ns)
+            control_receive_timestamp_ns = int(self.gello_received_at * 1e9)
+            gripper_target = 0.0 if self.gello_gripper_closed else 0.04
+            requested_action = np.concatenate(
+                [self.gello_joint_targets, [gripper_target, gripper_target]]
+            ).astype(np.float32)
         else:
             if self.gello_received_at is not None and not self._watchdog_holding:
                 self.gello_watchdog_holds += 1
@@ -326,26 +385,33 @@ class TeleopServer:
             operator_command = np.zeros(7, dtype=np.float32)
             control_sequence = -1
             control_timestamp_ns = -1
+            control_receive_timestamp_ns = -1
+            requested_action = action
         observation = self.task_scene.observe()
         images = self.task_scene.render()
+        capture_timestamp_ns = time.monotonic_ns()
+        self.task_scene.apply_action(action, self.args.physics_steps_per_control)
         if self.recorder.is_recording:
             self.recorder.add_frame(
                 images=images,
                 state=observation.state,
                 action=action,
+                requested_action=requested_action,
+                safe_action=action,
+                applied_action=action,
                 operator_command=operator_command,
                 ee_pose=observation.ee_pose,
                 target_ee_pose=self.task_scene.target_pose(),
                 object_pose=observation.object_pose,
                 object_velocity=observation.object_velocity,
                 sim_time=self.sim_time,
-                control_source_id=CONTROL_SOURCE_IDS[self.args.control_source],
                 control_sequence=control_sequence,
                 control_timestamp_ns=control_timestamp_ns,
+                control_receive_timestamp_ns=control_receive_timestamp_ns,
+                capture_timestamp_ns=capture_timestamp_ns,
                 cloth_particles=observation.cloth_particles,
                 cloth_particle_velocities=observation.cloth_particle_velocities,
             )
-        self.task_scene.apply_action(action, self.args.physics_steps_per_control)
         self.sim_time += self.args.sim_dt * self.args.physics_steps_per_control
         mosaic = self._compose_mosaic(images)
         ok, jpeg = cv2.imencode(
@@ -444,6 +510,7 @@ async def ws_handler(websocket, server: TeleopServer) -> None:
     server.clients.add(websocket)
     legacy_gello_session_id = f"legacy-{time.time_ns()}-{id(websocket)}"
     bound_gello_session_id: str | None = None
+    last_keyboard_sequence: int | None = None
     await websocket.send(json.dumps(server.status("Client connected")))
     try:
         async for message in websocket:
@@ -458,8 +525,18 @@ async def ws_handler(websocket, server: TeleopServer) -> None:
                         f"Message type {message_type!r} is disabled in {server.args.control_source} mode"
                     )
                 if message_type == "keydown":
+                    sequence, timestamp_ns = parse_keyboard_event(
+                        data, last_sequence=last_keyboard_sequence
+                    )
+                    last_keyboard_sequence = sequence
+                    server.record_keyboard_event(sequence, timestamp_ns)
                     log = server.handle_keydown(data["code"], data.get("task", server.task_scene.task_instruction))
                 elif message_type == "keyup":
+                    sequence, timestamp_ns = parse_keyboard_event(
+                        data, last_sequence=last_keyboard_sequence
+                    )
+                    last_keyboard_sequence = sequence
+                    server.record_keyboard_event(sequence, timestamp_ns)
                     server.control.keyup(data["code"])
                 elif message_type == "command":
                     log = server.handle_command(data["command"], data.get("task", server.task_scene.task_instruction))
@@ -556,9 +633,10 @@ def parse_args(control_source: str | None = None) -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--data-dir", type=Path)
     parser.add_argument("--control-fps", type=int, default=10)
-    parser.add_argument("--physics-steps-per-control", type=int, default=2)
+    parser.add_argument("--physics-steps-per-control", type=int, default=10)
     parser.add_argument("--sim-dt", type=float, default=0.01)
     parser.add_argument("--substeps", type=int, default=4)
+    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument(
@@ -594,6 +672,12 @@ def parse_args(control_source: str | None = None) -> argparse.Namespace:
     )
     if min(positive) <= 0 or args.smoke_steps < 0:
         parser.error("simulation, image, control values must be positive; smoke-steps cannot be negative")
+    try:
+        validate_control_timing(
+            args.control_fps, args.sim_dt, args.physics_steps_per_control
+        )
+    except ValueError as error:
+        parser.error(str(error))
     try:
         args.camera_profile = load_camera_profile(
             args.camera_profile_file, width=args.width, height=args.height

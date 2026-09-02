@@ -68,9 +68,11 @@ class SafeFrankaCommand:
     """One safety-filtered simulated Franka command."""
 
     joint_targets: tuple[float, ...]
+    requested_joint_targets: tuple[float, ...]
     gripper_closed: bool
     sequence: int | None
     source_timestamp_ns: int | None
+    receive_timestamp_ns: int | None
     watchdog_holding: bool
 
 
@@ -183,9 +185,15 @@ class GelloCommandController:
 
             return SafeFrankaCommand(
                 joint_targets=self._target,
+                requested_joint_targets=(
+                    tuple(self._latest.joint_targets) if fresh and self._latest is not None else self._target
+                ),
                 gripper_closed=self._gripper_closed,
                 sequence=self._last_sequence,
                 source_timestamp_ns=(self._latest.timestamp_ns if self._latest is not None else None),
+                receive_timestamp_ns=(
+                    int(self._latest_received_at * 1e9) if self._latest_received_at is not None else None
+                ),
                 watchdog_holding=self._watchdog_holding,
             )
 

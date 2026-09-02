@@ -17,6 +17,8 @@ import time
 import traceback
 from typing import Any
 
+from robot_data_contracts import CameraProfileV1, load_camera_profile
+
 from .backends import FRANKA_GRIPPER_CLOSED_M, IsaacLabFrankaBackend
 from .control import FRANKA_HOME, GelloCommandController
 from .protocol import GelloCommand
@@ -34,7 +36,7 @@ DEFAULT_WORK_SURFACE_HEIGHT_M = 0.25
 MIN_WORK_SURFACE_HEIGHT_M = 0.18
 MAX_WORK_SURFACE_HEIGHT_M = 0.32
 DEFAULT_CAMERA_PROFILE: dict[str, Any] = {
-    "format": "robot_data_studio_camera_profile",
+    "format": "robot_data_camera_profile",
     "format_version": 1,
     "id": "builtin_d435i_nominal_v1",
     "label": "Built-in nominal Intel RealSense D435i geometry",
@@ -143,36 +145,34 @@ def _scene_camera_overrides(
 def _load_camera_profile(path: Path | None, *, width: int, height: int) -> dict[str, Any]:
     """Load the import-safe camera profile before the Isaac application starts."""
     if path is None:
-        profile = json.loads(json.dumps(DEFAULT_CAMERA_PROFILE))
+        payload = json.loads(json.dumps(DEFAULT_CAMERA_PROFILE))
         source = "builtin"
-        for role in profile["roles"].values():
+        for role in payload["roles"].values():
             role["stream"]["width"] = width
             role["stream"]["height"] = height
+        profile = CameraProfileV1.model_validate(payload)
     else:
         resolved = path.expanduser().resolve()
-        profile = json.loads(resolved.read_text(encoding="utf-8"))
+        profile = load_camera_profile(resolved, width=width, height=height)
         source = str(resolved)
-    if profile.get("format") != "robot_data_studio_camera_profile" or profile.get("format_version") != 1:
-        raise ValueError("Camera profile has an unsupported format or version")
-    roles = profile.get("roles")
-    if not isinstance(roles, dict) or not {"agentview", "wrist"} <= roles.keys():
+    if not {"agentview", "wrist"} <= profile.roles.keys():
         raise ValueError("Camera profile must define agentview and wrist roles")
     for role_name in ("agentview", "wrist"):
-        role = roles[role_name]
-        stream = role.get("stream", {})
-        if not role.get("enabled") or (stream.get("width"), stream.get("height")) != (width, height):
+        role = profile.roles[role_name]
+        if not role.enabled or (role.stream.width, role.stream.height) != (width, height):
             raise ValueError(
                 f"Camera role {role_name!r} does not provide enabled {width}x{height} RGB"
             )
-        if role.get("intrinsics") is None and float(role.get("nominal_vertical_fov_deg", 0.0)) <= 0:
+        if role.intrinsics is None and not role.nominal_vertical_fov_deg:
             raise ValueError(f"Camera role {role_name!r} requires a nominal vertical field of view")
-    overrides = profile.get("engine_overrides", {}).get("isaac_sim")
+    value = profile.model_dump(mode="json")
+    overrides = value.get("engine_overrides", {}).get("isaac_sim")
     if not isinstance(overrides, dict) or not set(CAMERA_NAMES) <= overrides.keys():
         raise ValueError(
             "Camera profile must define Isaac Sim base, top, side, and wrist overrides"
         )
-    profile["profile_source"] = source
-    return profile
+    value["profile_source"] = source
+    return value
 
 
 def _camera_intrinsic_matrix(
@@ -890,6 +890,7 @@ def _parse_args() -> tuple[argparse.Namespace, object]:
         "--stream-fps", type=int, default=20, help="Kit/WebRTC viewport pump frequency"
     )
     parser.add_argument("--data-dir", default="data/isaac_episodes", help="raw episode output root")
+    parser.add_argument("--seed", type=int, default=0, help="episode and simulator random seed")
     parser.add_argument("--scene", default="franka_empty", choices=ISAAC_SCENE_IDS, help="scene plugin id")
     parser.add_argument(
         "--work-surface-height-m",
@@ -1200,7 +1201,7 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
     previews = CameraPreviewStore(target_fps=args.preview_fps)
     writer = None
     if args.smoke_steps == 0:
-        from robot_data_studio.runtime.episode_writer import EpisodeWriter
+        from robot_data_contracts import FrankaEpisodeWriter
 
         try:
             engine_version = importlib.metadata.version("isaacsim")
@@ -1216,16 +1217,19 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
             "target_joint_position/panda_finger_joint1_m",
             "target_joint_position/panda_finger_joint2_m",
         ]
-        writer = EpisodeWriter(
+        writer = FrankaEpisodeWriter(
             args.data_dir,
             fps=int(round(args.dataset_fps)),
             engine_id="isaac_sim",
             engine_version=engine_version,
             scene_id=args.scene,
-            robot_id="franka_panda",
-            control_source="gello",
+            seed=args.seed,
+            worker_id="gello_remote_isaac_sim",
+            control_source="gello_joint_targets",
             state_names=state_names,
             action_names=action_names,
+            operator_command_names=[f"requested_joint_position/panda_joint{index}_rad" for index in range(1, 8)]
+            + ["requested_gripper_closed"],
             camera_names=list(CAMERA_NAMES),
             run_metadata={
                 "isaaclab_device": args.device,
@@ -1248,6 +1252,8 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                 },
                 "automatic_outcome_available": False,
                 "scene_geometry": scene_geometry,
+                "git_roots": {"gello_remote": Path(__file__).resolve().parents[2]},
+                "dependency_packages": ["isaacsim", "numpy"],
             },
         )
     web_server = GelloWebServer(
@@ -1365,6 +1371,7 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                     and control_step % args.preview_control_decimation == 0
                 )
                 images = None
+                capture_timestamp_ns = None
                 if dataset_due or preview_due:
                     assert record_cameras
                     for camera in record_cameras.values():
@@ -1373,6 +1380,7 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                         name: camera.data.output["rgb"].torch[0].detach().cpu().numpy()
                         for name, camera in record_cameras.items()
                     }
+                    capture_timestamp_ns = time.monotonic_ns()
                 if preview_due and images is not None:
                     previews.submit(
                         images,
@@ -1391,20 +1399,27 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                         dtype=np.float32,
                     )
                     action = np.asarray((*safe_command.joint_targets, finger_target, finger_target), dtype=np.float32)
-                    policy_state = np.asarray(
-                        (
-                            *arm_positions,
-                            sum(finger_positions_before_action),
-                            *arm_velocities,
-                            sum(finger_velocities),
-                        ),
+                    requested_finger_target = FRANKA_GRIPPER_CLOSED_M if safe_command.gripper_closed else 0.04
+                    requested_action = np.asarray(
+                        (*safe_command.requested_joint_targets, requested_finger_target, requested_finger_target),
                         dtype=np.float32,
                     )
-                    policy_action = np.asarray((*safe_command.joint_targets, 2.0 * finger_target), dtype=np.float32)
+                    operator_command = np.asarray(
+                        (*safe_command.requested_joint_targets, float(safe_command.gripper_closed)),
+                        dtype=np.float32,
+                    )
+                    backend.set_command(
+                        safe_command.joint_targets,
+                        gripper_closed=safe_command.gripper_closed,
+                    )
                     writer.add_frame(
                         images=images,
                         state=state,
                         action=action,
+                        requested_action=requested_action,
+                        safe_action=action,
+                        applied_action=action,
+                        operator_command=operator_command,
                         sim_time=simulated_time,
                         control_sequence=safe_command.sequence if safe_command.sequence is not None else -1,
                         control_timestamp_ns=(
@@ -1412,16 +1427,19 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                             if safe_command.source_timestamp_ns is not None
                             else -1
                         ),
-                        extra_arrays={
-                            "policy_state": policy_state,
-                            "policy_action": policy_action,
-                        },
+                        control_receive_timestamp_ns=(
+                            safe_command.receive_timestamp_ns
+                            if safe_command.receive_timestamp_ns is not None
+                            else -1
+                        ),
+                        capture_timestamp_ns=capture_timestamp_ns,
                     )
                     recording.update(frames=writer.frame_count)
-                backend.set_command(
-                    safe_command.joint_targets,
-                    gripper_closed=safe_command.gripper_closed,
-                )
+                if not dataset_due:
+                    backend.set_command(
+                        safe_command.joint_targets,
+                        gripper_closed=safe_command.gripper_closed,
+                    )
                 if safe_command.watchdog_holding and target_at_watchdog is None:
                     target_at_watchdog = safe_command.joint_targets
                 control_finished = time.perf_counter()
