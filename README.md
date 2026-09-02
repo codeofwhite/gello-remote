@@ -52,6 +52,14 @@ The smoke process creates one simulated Franka, holds its default seven arm
 joints for a bounded number of physics steps, and exits. It does not expose a
 real-robot adapter, connect to robot hardware, or change the existing HTTP API.
 
+## Genesis worker
+
+The shared Genesis browser collector is launched from this repository and
+loads ClothTwin's scene, recording, and dataset implementation from its plugin
+checkout. Robot Data Studio launches `gello_remote.genesis_worker` for both
+keyboard and GELLO control; the historical `franka_only.*_collect` modules
+remain compatibility entry points.
+
 ## Direct GELLO control of Isaac Sim
 
 The IsaacLab 3.0 / Isaac Sim 6.0.1 entry point consumes the same calibrated
@@ -91,9 +99,10 @@ env CONDA_PREFIX=/home/zhanghejun/miniconda3/envs/isaaclab \
   PYTHONPATH=/data/zhanghejun/gello-remote/src PUBLIC_IP=219.223.200.145 \
   /data/zhanghejun/IsaacLab/isaaclab.sh -p -m gello_remote.isaaclab_gello \
   --gpu-id 6 --enable_cameras --livestream 1 --rendering_mode balanced \
+  --scene rigid_pick_place --work-surface-height-m 0.25 \
   --host 127.0.0.1 --port 18081 \
   --franka-usd https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/Isaac/IsaacLab/Robots/FrankaEmika/panda_instanceable.usd \
-  --kit_args "--/UJITSO/geometry=false --/persistent/UJITSO/geometry=false --/app/window/width=1280 --/app/window/height=720"
+  --kit_args "--/UJITSO/geometry=false --/persistent/UJITSO/geometry=false --/app/window/width=960 --/app/window/height=720"
 ```
 
 Forward the control page to the Windows machine and open it in desktop Chrome
@@ -104,22 +113,25 @@ ssh -N -L 8080:127.0.0.1:18081 zhanghejun@219.223.200.145
 ```
 
 Open `http://localhost:8080`. The single page contains the Isaac Sim WebRTC
-video, stream health, GELLO controls, and simulator telemetry. Explicitly choose
-COM3, capture the arm home and both gripper endpoints, set all seven joint
+video, four synchronized camera previews, stream health, GELLO controls, and
+simulator telemetry. Click `base`, `top`, `side`, or `wrist` (or press `1`–`4`)
+to promote that camera to the high-frame-rate WebRTC viewport; press `0` to
+restore the free operator view. The WebRTC viewport defaults to 20 FPS via
+`--stream-fps`, leaving render capacity for the four 10 Hz dataset cameras.
+Explicitly choose COM3, place GELLO near the middle of its mechanical travel,
+capture the arm home and both gripper endpoints, set all seven joint
 directions, and only then enable control. Set `--gpu-id N` to the physical GPU
-index shown by `nvidia-smi`; the entry point keeps Isaac Lab, PhysX, the active
-RTX GPU, and the single-GPU renderer subset aligned automatically. Do not also
-pass `--device` or GPU-routing settings through `--kit_args`, and do not set
-`CUDA_VISIBLE_DEVICES`: Isaac Sim 6.0.1 warns that CUDA and Vulkan enumerate
-devices differently.
+index shown by `nvidia-smi`. The entry point exposes only that physical device
+through `CUDA_VISIBLE_DEVICES`, routes Isaac Lab and PhysX to the resulting
+logical `cuda:0`, and keeps RTX/Vulkan on physical GPU `N`. It also disables
+multi-GPU rendering. `--gpu-id` takes precedence over an inherited
+`CUDA_VISIBLE_DEVICES`; do not also pass `--device` or GPU-routing settings
+through `--kit_args`.
 
-On the tested eight-RTX-5090 host, `--gpu-id` selects the requested GPU as the
-only active RTX/PhysX workload device, but Isaac Sim 6.0.1 still creates an
-approximately 512 MiB startup CUDA context on every enumerated GPU. Therefore
-this option is coordinated device selection, not hard process isolation. If
-other GPUs must show no context from this process, run Isaac Sim in an external
-device-isolated environment; `CUDA_VISIBLE_DEVICES` is not used here because it
-prevented the Vulkan renderer from creating a compatible device in this setup.
+This split mapping is required because CUDA renumbers a one-device visibility
+mask to logical device 0 while Kit's RTX `activeGpu` follows the physical index
+shown by `nvidia-smi`. On a shared host, verify after startup that the Isaac Sim
+PID appears only on the selected GPU.
 
 The live entry point validates `/World/Franka`, the ground plane, the light,
 the active viewport, and its camera before reporting `sim_ready`. It also keeps
@@ -136,11 +148,19 @@ the last safe arm and gripper targets.
 With `--data-dir`, the live entry point also exposes episode controls in the
 same browser console. `Start` creates one temporary episode, `Success` or
 `Failure` atomically commits it, and `Discard` removes the temporary data. The
-episode stores synchronized `base` and `wrist` RGB streams, simulator time, Franka joint
+episode stores synchronized `base`, `top`, `side`, and `wrist` RGB streams,
+simulator time, Franka joint
 positions and velocities, commanded joint targets, policy state/action arrays,
 and GELLO sequence/source timestamps using RoboData Studio's common episode
-contract. Automatic task success is intentionally unavailable for the empty
-Franka scene; only the operator outcome is written.
+contract. Camera previews default to 10 Hz and use a bounded latest-frame
+encoder, while Episode frames are never dropped. Episode cadence defaults to
+the camera profile's `dataset_fps_default`; `--preview-fps` and `--dataset-fps`
+may override these values when both divide `--control_hz` exactly.
+`franka_empty` remains available for control diagnostics. The
+`rigid_pick_place` scene adds a resettable 5 cm cube, target marker, and a work
+surface whose top is `0.25 m` above the Franka base by default. Tune it within
+`0.18--0.32 m` using `--work-surface-height-m`. Automatic task success is not
+yet evaluated in Isaac Sim, so only the operator outcome is written.
 
 Pass `--camera-profile-file /absolute/path/to/profile.json` to select the same
 sensor profile used by RoboData Studio. The lab profile models the active main
@@ -152,7 +172,11 @@ intrinsics are populated in the profile, both render cameras are explicitly
 recorded as `nominal_pending_intrinsics` and use a nominal 42-degree vertical
 field of view rather than claiming physical calibration.
 
-This milestone validates the code structure and one simulated Franka in an
-empty scene. It does not yet control cloth, validate real COM3 calibration, or
-send any command to a physical robot. The recording path has unit/import
-coverage, but no GPU recording episode has been collected in this change set.
+The `top` and `side` streams are explicitly marked virtual auxiliary views in
+the Isaac Sim profile. They improve XY and contact/height judgment without
+claiming that the lab owns two additional matching physical cameras.
+
+This milestone provides empty-scene diagnostics and a rigid pick-place
+collection scene. It does not yet control cloth, validate real COM3
+calibration, or send any command to a physical robot. GPU validation uses short
+simulated hold episodes; it is not evidence of successful task manipulation.

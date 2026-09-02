@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { normalizePort, resolveStreamConfig } from "../src/config.mjs";
+import { normalizeFps, normalizePort, resolveStreamConfig } from "../src/config.mjs";
 
 test("resolves runtime stream config", () => {
   assert.deepEqual(
@@ -11,6 +11,7 @@ test("resolves runtime stream config", () => {
       media_port: 47998,
       width: 1280,
       height: 720,
+      fps: 30,
     }),
     {
       signalingServer: "203.0.113.10",
@@ -19,6 +20,7 @@ test("resolves runtime stream config", () => {
       mediaPort: 47998,
       width: 1280,
       height: 720,
+      fps: 30,
     },
   );
 });
@@ -40,4 +42,5 @@ test("rejects missing host and invalid ports", () => {
     /stream host is missing/,
   );
   assert.throws(() => normalizePort(70000, 49100), /Invalid port/);
+  assert.throws(() => normalizeFps(0), /Invalid FPS/);
 });

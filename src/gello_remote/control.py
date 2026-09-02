@@ -15,6 +15,54 @@ from .protocol import GelloCommand
 FRANKA_HOME = (0.0, -0.65, 0.0, -2.25, 0.0, 1.75, 0.78)
 
 
+class GelloSessionGate:
+    """Reject stale sequences and competing live browser control sessions."""
+
+    def __init__(
+        self,
+        watchdog_timeout: float = 0.3,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if not math.isfinite(watchdog_timeout) or watchdog_timeout <= 0:
+            raise ValueError("watchdog_timeout must be positive and finite")
+        self._watchdog_timeout = float(watchdog_timeout)
+        self._clock = clock
+        self._active_session_id: str | None = None
+        self._last_sequence: int | None = None
+        self._last_received_at: float | None = None
+
+    @property
+    def active_session_id(self) -> str | None:
+        return self._active_session_id
+
+    def accept(self, command: GelloCommand, *, received_at: float | None = None) -> bool:
+        now = self._clock() if received_at is None else float(received_at)
+        if not math.isfinite(now):
+            raise ValueError("received_at must be finite")
+        active_is_fresh = (
+            self._active_session_id is not None
+            and self._last_received_at is not None
+            and now - self._last_received_at <= self._watchdog_timeout
+        )
+        if command.session_id != self._active_session_id:
+            if active_is_fresh:
+                return False
+            self._active_session_id = command.session_id
+            self._last_sequence = None
+        if self._last_sequence is not None and command.sequence <= self._last_sequence:
+            return False
+        self._last_sequence = command.sequence
+        self._last_received_at = now
+        return True
+
+    def release(self, session_id: str) -> None:
+        if session_id == self._active_session_id:
+            self._active_session_id = None
+            self._last_sequence = None
+            self._last_received_at = None
+
+
 @dataclass(frozen=True)
 class SafeFrankaCommand:
     """One safety-filtered simulated Franka command."""
@@ -58,6 +106,7 @@ class GelloCommandController:
         self._max_step = max_joint_speed / control_hz
         self._watchdog_timeout = watchdog_timeout
         self._clock = clock
+        self._session_gate = GelloSessionGate(watchdog_timeout, clock=clock)
         self._lock = threading.Lock()
         self._latest: GelloCommand | None = None
         self._latest_received_at: float | None = None
@@ -80,7 +129,7 @@ class GelloCommandController:
         if not math.isfinite(now):
             raise ValueError("received_at must be finite")
         with self._lock:
-            if self._last_sequence is not None and command.sequence <= self._last_sequence:
+            if not self._session_gate.accept(command, received_at=now):
                 self._rejected_stale_commands += 1
                 return False
             self._latest = command
@@ -89,6 +138,14 @@ class GelloCommandController:
             self._accepted_commands += 1
             self._watchdog_holding = False
             return True
+
+    def release_session(self, session_id: str) -> None:
+        """Release a disconnected browser session without changing the held target."""
+        with self._lock:
+            self._session_gate.release(session_id)
+            if self._latest is not None and self._latest.session_id == session_id:
+                self._latest = None
+                self._latest_received_at = None
 
     def reset_targets(self, joint_targets: Sequence[float]) -> None:
         """Return the held command to a validated pose without weakening sequence checks."""
@@ -146,6 +203,7 @@ class GelloCommandController:
             )
             return {
                 "sequence": self._last_sequence,
+                "session_id": self._session_gate.active_session_id,
                 "age_ms": round(age_ms, 1) if age_ms is not None else None,
                 "source_age_ms": round(source_age_ms, 1) if source_age_ms is not None else None,
                 "watchdog_holding": self._watchdog_holding,

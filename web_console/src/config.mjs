@@ -6,6 +6,14 @@ export function normalizePort(value, fallback) {
   return port;
 }
 
+export function normalizeFps(value, fallback = 30) {
+  const fps = Number(value ?? fallback);
+  if (!Number.isInteger(fps) || fps < 1 || fps > 240) {
+    throw new Error(`Invalid FPS: ${value}`);
+  }
+  return fps;
+}
+
 export function resolveStreamConfig(runtimeConfig, search = "") {
   const params = new URLSearchParams(search);
   const signalingServer = params.get("server") || runtimeConfig.stream_host;
@@ -18,7 +26,8 @@ export function resolveStreamConfig(runtimeConfig, search = "") {
     signalingPort: normalizePort(params.get("signalingPort"), runtimeConfig.signaling_port),
     mediaServer,
     mediaPort: normalizePort(params.get("mediaPort"), runtimeConfig.media_port),
-    width: normalizePort(runtimeConfig.width, 1280),
+    width: normalizePort(runtimeConfig.width, 960),
     height: normalizePort(runtimeConfig.height, 720),
+    fps: normalizeFps(runtimeConfig.fps, 30),
   };
 }

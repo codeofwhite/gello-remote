@@ -12,6 +12,7 @@
           <div>
             <strong>Browser Teleoperation Console</strong>
             <span class="engine-badge">Isaac Sim</span>
+            <span id="active-view-label" class="active-view-label">Main: Free</span>
           </div>
           <span id="stream-status" class="status status-connecting">Connecting</span>
         </header>
@@ -27,8 +28,67 @@
             <span id="stream-detail">Waiting for runtime configuration.</span>
           </div>
         </div>
+        <section class="sensor-preview-strip" aria-label="Recorded camera previews">
+          <article class="sensor-preview-card" data-preview-camera="base" role="button" tabindex="0" aria-label="Show base camera in main WebRTC view">
+            <header>
+              <span><strong>Base</strong> · recorded</span>
+              <span id="base-preview-status" class="preview-status preview-waiting">WAITING</span>
+            </header>
+            <div class="sensor-preview-surface">
+              <img id="base-preview-image" alt="Isaac Sim base recording camera" hidden />
+              <span id="base-preview-overlay">Waiting for camera frame…</span>
+            </div>
+            <footer>
+              <span id="base-preview-frame">Frame –</span>
+              <span id="base-preview-age">Age –</span>
+            </footer>
+          </article>
+          <article class="sensor-preview-card" data-preview-camera="top" role="button" tabindex="0" aria-label="Show top camera in main WebRTC view">
+            <header>
+              <span><strong>Top</strong> · recorded</span>
+              <span id="top-preview-status" class="preview-status preview-waiting">WAITING</span>
+            </header>
+            <div class="sensor-preview-surface">
+              <img id="top-preview-image" alt="Isaac Sim top recording camera" hidden />
+              <span id="top-preview-overlay">Waiting for camera frame…</span>
+            </div>
+            <footer>
+              <span id="top-preview-frame">Frame –</span>
+              <span id="top-preview-age">Age –</span>
+            </footer>
+          </article>
+          <article class="sensor-preview-card" data-preview-camera="side" role="button" tabindex="0" aria-label="Show side camera in main WebRTC view">
+            <header>
+              <span><strong>Side</strong> · recorded</span>
+              <span id="side-preview-status" class="preview-status preview-waiting">WAITING</span>
+            </header>
+            <div class="sensor-preview-surface">
+              <img id="side-preview-image" alt="Isaac Sim side recording camera" hidden />
+              <span id="side-preview-overlay">Waiting for camera frame…</span>
+            </div>
+            <footer>
+              <span id="side-preview-frame">Frame –</span>
+              <span id="side-preview-age">Age –</span>
+            </footer>
+          </article>
+          <article class="sensor-preview-card" data-preview-camera="wrist" role="button" tabindex="0" aria-label="Show wrist camera in main WebRTC view">
+            <header>
+              <span><strong>Wrist</strong> · recorded</span>
+              <span id="wrist-preview-status" class="preview-status preview-waiting">WAITING</span>
+            </header>
+            <div class="sensor-preview-surface">
+              <img id="wrist-preview-image" alt="Isaac Sim wrist recording camera" hidden />
+              <span id="wrist-preview-overlay">Waiting for camera frame…</span>
+            </div>
+            <footer>
+              <span id="wrist-preview-frame">Frame –</span>
+              <span id="wrist-preview-age">Age –</span>
+            </footer>
+          </article>
+        </section>
         <footer class="video-footer">
           <span id="stream-endpoint">WebRTC: waiting</span>
+          <span>Views: 0 Free · 1 Base · 2 Top · 3 Side · 4 Wrist</span>
           <span id="video-dimensions">Video: 0×0</span>
         </footer>
       </section>

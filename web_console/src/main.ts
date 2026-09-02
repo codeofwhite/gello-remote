@@ -32,6 +32,7 @@ const streamMessage = byId<HTMLElement>("stream-message");
 const streamDetail = byId<HTMLSpanElement>("stream-detail");
 const streamEndpoint = byId<HTMLSpanElement>("stream-endpoint");
 const videoDimensions = byId<HTMLSpanElement>("video-dimensions");
+const activeViewLabel = byId<HTMLSpanElement>("active-view-label");
 const mainDiv = byId<HTMLDivElement>("main-div");
 const video = byId<HTMLVideoElement>("remote-video");
 
@@ -73,7 +74,7 @@ async function connectStream() {
       forceWSS: false,
       width: endpoint.width,
       height: endpoint.height,
-      fps: 60,
+      fps: endpoint.fps,
       onStart: (event: StreamEvent) => {
         if (event.action !== eAction.start) return;
         if (event.status === eStatus.success) {
@@ -117,12 +118,118 @@ const discardRecordingButton = byId<HTMLButtonElement>("record-discard");
 const resetEnvironmentButton = byId<HTMLButtonElement>("environment-reset");
 const recordingStatusElement = byId<HTMLDivElement>("recording-status");
 
+type PreviewName = "base" | "top" | "side" | "wrist";
+type StreamView = "free" | PreviewName;
+type PreviewState = {
+  image: HTMLImageElement;
+  overlay: HTMLSpanElement;
+  status: HTMLSpanElement;
+  frame: HTMLSpanElement;
+  age: HTMLSpanElement;
+  lastReceivedMs: number | null;
+  objectUrl: string | null;
+};
+
+const previewNames: PreviewName[] = ["base", "top", "side", "wrist"];
+const previewByCameraId: Record<number, PreviewName> = {
+  0: "base",
+  1: "top",
+  2: "side",
+  3: "wrist",
+};
+const previewCards = [...document.querySelectorAll<HTMLElement>("[data-preview-camera]")];
+const previewStates = Object.fromEntries(previewNames.map((name) => [name, {
+  image: byId<HTMLImageElement>(`${name}-preview-image`),
+  overlay: byId<HTMLSpanElement>(`${name}-preview-overlay`),
+  status: byId<HTMLSpanElement>(`${name}-preview-status`),
+  frame: byId<HTMLSpanElement>(`${name}-preview-frame`),
+  age: byId<HTMLSpanElement>(`${name}-preview-age`),
+  lastReceivedMs: null,
+  objectUrl: null,
+}])) as Record<PreviewName, PreviewState>;
+
+const PREVIEW_HEADER_BYTES = 22;
+const PREVIEW_STALE_AFTER_MS = 750;
+
+function setActiveView(view: StreamView) {
+  activeViewLabel.textContent = `Main: ${view[0].toUpperCase()}${view.slice(1)}`;
+  for (const card of previewCards) {
+    const active = card.dataset.previewCamera === view;
+    card.classList.toggle("sensor-preview-active", active);
+    card.setAttribute("aria-pressed", String(active));
+  }
+}
+
+function setPreviewState(name: PreviewName, state: "live" | "stale" | "waiting", detail?: string) {
+  const preview = previewStates[name];
+  preview.status.textContent = state.toUpperCase();
+  preview.status.className = `preview-status preview-${state}`;
+  if (state === "waiting") {
+    preview.overlay.textContent = detail ?? "Waiting for camera frame…";
+    preview.overlay.hidden = false;
+  } else {
+    preview.overlay.hidden = true;
+  }
+}
+
+async function updatePreview(payload: ArrayBuffer | Blob) {
+  const buffer = payload instanceof Blob ? await payload.arrayBuffer() : payload;
+  if (buffer.byteLength <= PREVIEW_HEADER_BYTES) throw new Error("Preview packet is truncated");
+  const bytes = new Uint8Array(buffer);
+  if (bytes[0] !== 0x52 || bytes[1] !== 0x44 || bytes[2] !== 0x53 || bytes[3] !== 0x43) {
+    throw new Error("Preview packet has invalid magic");
+  }
+  const view = new DataView(buffer);
+  const version = view.getUint8(4);
+  const name = previewByCameraId[view.getUint8(5)];
+  if (version !== 1 || !name) throw new Error(`Unsupported preview protocol ${version}`);
+  const frameIndex = view.getBigUint64(6, false);
+  // Bytes 14..21 carry the server monotonic capture timestamp for protocol provenance.
+  view.getBigUint64(14, false);
+  const preview = previewStates[name];
+  const nextUrl = URL.createObjectURL(new Blob([buffer.slice(PREVIEW_HEADER_BYTES)], { type: "image/jpeg" }));
+  const previousUrl = preview.objectUrl;
+  preview.objectUrl = nextUrl;
+  preview.image.onload = () => {
+    if (previousUrl) URL.revokeObjectURL(previousUrl);
+  };
+  preview.image.src = nextUrl;
+  preview.image.hidden = false;
+  preview.lastReceivedMs = performance.now();
+  preview.frame.textContent = `Frame ${frameIndex}`;
+  preview.age.textContent = "Age 0.0 s";
+  setPreviewState(name, "live");
+}
+
+function refreshPreviewFreshness() {
+  const now = performance.now();
+  for (const name of previewNames) {
+    const preview = previewStates[name];
+    if (preview.lastReceivedMs === null) continue;
+    const ageMs = now - preview.lastReceivedMs;
+    preview.age.textContent = `Age ${(ageMs / 1000).toFixed(1)} s`;
+    setPreviewState(name, ageMs > PREVIEW_STALE_AFTER_MS ? "stale" : "live");
+  }
+}
+
+function markPreviewsWaiting(detail: string) {
+  for (const name of previewNames) {
+    previewStates[name].lastReceivedMs = null;
+    setPreviewState(name, "waiting", detail);
+  }
+}
+
 let socket: WebSocket | undefined;
 let rawSample: number[] | null = null;
 let armZero: number[] | null = null;
 let gripperOpen: number | null = null;
 let gripperClosed: number | null = null;
 let sequence = 0;
+let sessionId = newGelloSessionId();
+
+function newGelloSessionId() {
+  return globalThis.crypto?.randomUUID?.() ?? `browser-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
 
 function calibrationReady() {
   return armZero !== null && gripperOpen !== null && gripperClosed !== null && gripperOpen !== gripperClosed;
@@ -163,6 +270,8 @@ function handleSample(raw: number[]) {
     const directions = directionElements.map((element) => Number(element.value));
     socket.send(JSON.stringify({
       type: "gello",
+      version: 1,
+      session_id: sessionId,
       sequence: sequence++,
       timestamp_ns: Date.now() * 1e6,
       joint_targets: mapJointPositions(raw, armZero, directions),
@@ -182,6 +291,7 @@ connectButton.onclick = async () => {
   gripperOpen = null;
   gripperClosed = null;
   sequence = 0;
+  sessionId = newGelloSessionId();
   updateButtons();
   try {
     await reader.connect();
@@ -228,10 +338,21 @@ enableControl.onchange = () => {
 
 function updateTelemetry(message: any) {
   const gello = message.gello;
+  const previews = message.previews ?? {};
+  if (!taskInput.dataset.sceneInitialized && message.scene_task) {
+    taskInput.value = message.scene_task;
+    taskInput.dataset.sceneInitialized = "true";
+  }
+  const previewLagged = previews.encoded > 5 && previews.actual_fps < previews.target_fps * 0.8;
   simStatusElement.textContent = `Simulator: ${message.sim_ready ? "ready" : "starting"} | sequence: ${gello.sequence ?? "–"} | age: ${gello.age_ms ?? "–"} ms | watchdog: ${gello.watchdog_holding ? "HOLD" : "fresh"} | holds: ${gello.watchdog_holds}`;
-  simStatusElement.className = `status-text ${gello.watchdog_holding ? "warning" : "ok"}`;
+  simStatusElement.className = `status-text ${gello.watchdog_holding || previewLagged ? "warning" : "ok"}`;
   const fingers = message.finger_positions?.map((value: number) => Number(value).toFixed(4)).join(", ") ?? "–";
-  telemetryElement.textContent = `Tracking max error: ${message.tracking_error_max_rad ?? "–"} rad | fingers: ${fingers} m${message.log ? ` | ${message.log}` : ""}`;
+  const surface = message.work_surface_top_m == null ? "–" : Number(message.work_surface_top_m).toFixed(3);
+  const tcp = message.tcp_z_m == null ? "–" : Number(message.tcp_z_m).toFixed(3);
+  const clearance = message.tcp_surface_clearance_m == null ? "–" : Number(message.tcp_surface_clearance_m).toFixed(3);
+  telemetryElement.textContent = `Scene: ${message.scene_id ?? "–"} | TCP/surface/clearance: ${tcp}/${surface}/${clearance} m | tracking max error: ${message.tracking_error_max_rad ?? "–"} rad | fingers: ${fingers} m | preview: ${previews.actual_fps ?? "–"}/${previews.target_fps ?? "–"} FPS, ${previews.encode_ms ?? "–"} ms encode, ${previews.dropped ?? 0} dropped | control: ${message.control_actual_hz ?? "–"} Hz, p95 ${message.control_tick_p95_ms ?? "–"} ms${message.log ? ` | ${message.log}` : ""}`;
+  const activeView = message.view?.active;
+  if (["free", ...previewNames].includes(activeView)) setActiveView(activeView as StreamView);
   const recording = message.recording ?? {};
   const active = Boolean(recording.recording);
   startRecordingButton.disabled = active;
@@ -255,22 +376,67 @@ function sendRecordingCommand(command: "start" | "success" | "failure" | "discar
   socket.send(JSON.stringify({ type: "command", command, task: taskInput.value.trim() }));
 }
 
+function sendViewCommand(view: StreamView) {
+  if (socket?.readyState !== WebSocket.OPEN) {
+    simStatusElement.textContent = "Simulator WebSocket is not connected.";
+    simStatusElement.className = "status-text error";
+    return;
+  }
+  socket.send(JSON.stringify({ type: "view", view }));
+}
+
 startRecordingButton.onclick = () => sendRecordingCommand("start");
 saveSuccessButton.onclick = () => sendRecordingCommand("success");
 saveFailureButton.onclick = () => sendRecordingCommand("failure");
 discardRecordingButton.onclick = () => sendRecordingCommand("discard");
 resetEnvironmentButton.onclick = () => sendRecordingCommand("reset");
 
+for (const card of previewCards) {
+  const view = card.dataset.previewCamera as PreviewName;
+  card.onclick = () => sendViewCommand(view);
+  card.onkeydown = (event) => {
+    if (event.key !== "Enter" && event.key !== " ") return;
+    event.preventDefault();
+    sendViewCommand(view);
+  };
+}
+
+const shortcutViews: Record<string, StreamView> = {
+  Digit0: "free",
+  Digit1: "base",
+  Digit2: "top",
+  Digit3: "side",
+  Digit4: "wrist",
+};
+document.addEventListener("keydown", (event) => {
+  const target = event.target as HTMLElement | null;
+  if (event.repeat || target?.matches("input, select, button, textarea")) return;
+  const view = shortcutViews[event.code];
+  if (!view) return;
+  event.preventDefault();
+  sendViewCommand(view);
+});
+
 function connectControlSocket() {
   const scheme = window.location.protocol === "https:" ? "wss" : "ws";
   socket = new WebSocket(`${scheme}://${window.location.host}/control`);
+  socket.binaryType = "arraybuffer";
   socket.onopen = () => {
     simStatusElement.textContent = "Simulator WebSocket connected.";
     simStatusElement.className = "status-text ok";
   };
-  socket.onmessage = (event) => updateTelemetry(JSON.parse(event.data));
+  socket.onmessage = (event) => {
+    if (typeof event.data === "string") {
+      updateTelemetry(JSON.parse(event.data));
+      return;
+    }
+    void updatePreview(event.data).catch((error) => {
+      console.error("Camera preview rejected", error);
+    });
+  };
   socket.onclose = () => {
     stopControl();
+    markPreviewsWaiting("Control socket disconnected");
     simStatusElement.textContent = "Simulator WebSocket disconnected; reconnecting…";
     simStatusElement.className = "status-text error";
     window.setTimeout(connectControlSocket, 2000);
@@ -283,5 +449,12 @@ if (!("serial" in navigator)) {
 }
 
 connectControlSocket();
+setActiveView("free");
 void connectStream();
-window.addEventListener("beforeunload", () => void reader.disconnect());
+window.setInterval(refreshPreviewFreshness, 500);
+window.addEventListener("beforeunload", () => {
+  void reader.disconnect();
+  for (const preview of Object.values(previewStates)) {
+    if (preview.objectUrl) URL.revokeObjectURL(preview.objectUrl);
+  }
+});

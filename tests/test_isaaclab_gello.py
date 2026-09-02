@@ -1,24 +1,174 @@
 from contextlib import contextmanager
 from http import HTTPStatus
 import math
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
 from websockets.datastructures import Headers
 
 from gello_remote.isaaclab_gello import (
+    CAMERA_NAMES,
+    CameraPreviewStore,
+    DEFAULT_CAMERA_PROFILE,
+    DEFAULT_WORK_SURFACE_HEIGHT_M,
     GelloWebServer,
+    PREVIEW_CAMERA_IDS,
+    PREVIEW_HEADER,
+    PREVIEW_MAGIC,
+    PREVIEW_PROTOCOL_VERSION,
     RecordingCommandStore,
+    STREAM_HEIGHT,
     STREAM_SCENE_PRIMS,
+    STREAM_WIDTH,
     TelemetryStore,
+    ViewCommandStore,
     WEB_CONSOLE_ROOT,
+    _apply_split_gpu_launcher_config,
     _configure_gpu_selection,
+    _encode_preview_packet,
+    _frequency_decimation,
     _camera_intrinsic_matrix,
     _camera_profile_metadata,
+    _rigid_pick_place_geometry,
+    _scene_camera_overrides,
     _load_camera_profile,
     _missing_scene_prims,
     _pump_kit_frame,
 )
+
+
+def test_rigid_pick_place_geometry_raises_objects_above_robot_base() -> None:
+    geometry = _rigid_pick_place_geometry(DEFAULT_WORK_SURFACE_HEIGHT_M)
+
+    assert geometry["work_surface_top_m"] == 0.25
+    assert geometry["work_surface_center_m"] == (0.50, 0.00, 0.125)
+    assert geometry["object_start_m"] == (0.55, -0.10, 0.277)
+    assert geometry["target_center_m"] == (0.48, 0.12, 0.252)
+
+    for invalid in (0.17, 0.33, math.nan):
+        try:
+            _rigid_pick_place_geometry(invalid)
+        except ValueError as exc:
+            assert "work-surface-height-m" in str(exc)
+        else:
+            raise AssertionError("expected invalid work surface height")
+
+
+def test_scene_camera_targets_follow_surface_without_mutating_profile() -> None:
+    original_target = list(
+        DEFAULT_CAMERA_PROFILE["engine_overrides"]["isaac_sim"]["base"]["target_world_m"]
+    )
+    overrides = _scene_camera_overrides(
+        DEFAULT_CAMERA_PROFILE, work_surface_top_m=0.25
+    )
+
+    assert overrides["base"]["target_world_m"] == [0.45, 0.0, 0.40]
+    assert overrides["top"]["target_world_m"] == [0.45, 0.0, 0.25]
+    assert overrides["side"]["target_world_m"] == [0.45, 0.0, 0.39]
+    assert (
+        DEFAULT_CAMERA_PROFILE["engine_overrides"]["isaac_sim"]["base"]["target_world_m"]
+        == original_target
+    )
+
+
+def test_stream_and_recording_defaults_share_four_by_three_framing() -> None:
+    assert (STREAM_WIDTH, STREAM_HEIGHT) == (960, 720)
+    assert STREAM_WIDTH / STREAM_HEIGHT == 640 / 480
+
+
+def test_camera_preview_store_publishes_versioned_binary_packets(monkeypatch) -> None:
+    monkeypatch.setattr(
+        CameraPreviewStore,
+        "_encode_jpeg",
+        staticmethod(lambda image: b"jpeg-" + bytes([image])),
+    )
+    previews = CameraPreviewStore()
+
+    images = {name: index for index, name in enumerate(CAMERA_NAMES, start=1)}
+    previews.update(images, frame_index=42, captured_at_ns=123456)
+    packets = previews.packets_since({name: -1 for name in CAMERA_NAMES})
+
+    assert [name for name, _, _ in packets] == list(CAMERA_NAMES)
+    for name, version, packet in packets:
+        magic, protocol, camera_id, frame_index, captured_at_ns = PREVIEW_HEADER.unpack(
+            packet[: PREVIEW_HEADER.size]
+        )
+        assert magic == PREVIEW_MAGIC
+        assert protocol == PREVIEW_PROTOCOL_VERSION
+        assert camera_id == PREVIEW_CAMERA_IDS[name]
+        assert frame_index == 42
+        assert captured_at_ns == 123456
+        assert version == 1
+        assert packet[PREVIEW_HEADER.size :].startswith(b"jpeg-")
+    assert previews.packets_since({name: 1 for name in CAMERA_NAMES}) == []
+
+
+def test_preview_packet_rejects_unknown_camera_and_empty_payload() -> None:
+    for camera_name, jpeg, message in (
+        ("unknown", b"jpeg", "unknown preview camera"),
+        ("base", b"", "preview JPEG must contain"),
+    ):
+        try:
+            _encode_preview_packet(
+                camera_name, frame_index=0, captured_at_ns=0, jpeg=jpeg
+            )
+        except ValueError as exc:
+            assert message in str(exc)
+        else:
+            raise AssertionError("expected invalid preview packet to fail")
+
+
+def test_preview_worker_encodes_four_views_and_stops(monkeypatch) -> None:
+    monkeypatch.setattr(
+        CameraPreviewStore,
+        "_encode_jpeg",
+        staticmethod(lambda image: b"jpeg-" + bytes([image])),
+    )
+    previews = CameraPreviewStore(target_fps=10.0)
+    previews.start()
+    previews.submit(
+        {name: index for index, name in enumerate(CAMERA_NAMES, start=1)},
+        frame_index=2,
+        captured_at_ns=3,
+    )
+    previews.stop()
+
+    assert len(previews.packets_since({name: -1 for name in CAMERA_NAMES})) == 4
+    assert previews.stats()["encoded"] == 1
+
+
+def test_view_commands_validate_and_keep_active_view_separate() -> None:
+    views = ViewCommandStore()
+    views.submit("top")
+
+    assert views.snapshot()["active"] == "free"
+    assert views.snapshot()["requested"] == "top"
+    assert views.drain() == ["top"]
+    views.activate("top", "/World/RecordCameraTop")
+    assert views.snapshot() == {
+        "active": "top",
+        "requested": "top",
+        "camera_path": "/World/RecordCameraTop",
+    }
+
+    try:
+        views.submit("unknown")
+    except ValueError as exc:
+        assert "unknown stream view" in str(exc)
+    else:
+        raise AssertionError("expected invalid stream view to fail")
+
+
+def test_camera_frequencies_require_exact_control_decimation() -> None:
+    assert _frequency_decimation(20.0, 10.0, label="preview-fps") == 2
+    for target, message in ((0.0, "positive"), (30.0, "no greater"), (7.0, "integer multiple")):
+        try:
+            _frequency_decimation(20.0, target, label="preview-fps")
+        except ValueError as exc:
+            assert message in str(exc)
+        else:
+            raise AssertionError("expected invalid camera frequency")
 
 
 def test_lab_camera_profile_drives_dual_d435i_recording() -> None:
@@ -32,6 +182,14 @@ def test_lab_camera_profile_drives_dual_d435i_recording() -> None:
     assert profile["engine_overrides"]["isaac_sim"]["wrist"]["prim_path"].endswith(
         "/panda_hand/wrist_cam"
     )
+    assert profile["engine_overrides"]["isaac_sim"]["wrist"]["position_parent_m"] == [
+        0.13,
+        0.0,
+        -0.19,
+    ]
+    assert profile["roles"]["wrist"]["nominal_vertical_fov_deg"] == 42.0
+    assert profile["engine_overrides"]["isaac_sim"]["top"]["virtual_auxiliary"] is True
+    assert profile["engine_overrides"]["isaac_sim"]["side"]["virtual_auxiliary"] is True
     assert metadata["match_level"] == "nominal_pending_intrinsics"
     assert metadata["roles"]["agentview"]["calibration_source_serial"] == "261722075807"
     assert metadata["roles"]["wrist"]["calibration_source_serial"] == "261622075579"
@@ -79,12 +237,15 @@ class FakeStage:
         return self._prims.get(path, FakePrim(valid=False))
 
 
-def test_gpu_id_configures_simulation_and_single_gpu_renderer() -> None:
+def test_gpu_id_configures_simulation_and_single_gpu_renderer(monkeypatch) -> None:
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1")
     args = SimpleNamespace(gpu_id=6, device="cuda:0", kit_args="--/app/window/width=1280")
 
     _configure_gpu_selection(args, ["--gpu-id", "6"])
 
-    assert args.device == "cuda:6"
+    assert args.device == "cuda:0"
+    assert args.renderer_gpu_id == 6
+    assert os.environ["CUDA_VISIBLE_DEVICES"] == "6"
     assert args.kit_args.split() == [
         "--/app/window/width=1280",
         "--/renderer/multiGpu/enabled=false",
@@ -92,6 +253,14 @@ def test_gpu_id_configures_simulation_and_single_gpu_renderer() -> None:
         "--/renderer/multiGpu/activeGpus=6",
         "--/renderer/multiGpu/maxGpuCount=1",
     ]
+
+
+def test_split_gpu_launcher_config_uses_physical_renderer_and_logical_cuda() -> None:
+    launcher_args: dict[str, object] = {"active_gpu": 0, "physics_gpu": 6}
+
+    _apply_split_gpu_launcher_config(launcher_args, physical_gpu_id=6)
+
+    assert launcher_args == {"active_gpu": 6, "physics_gpu": 0}
 
 
 def test_gpu_id_rejects_negative_or_competing_device_selection() -> None:

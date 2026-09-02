@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ClothTwin · 键盘采集</title>
+  <link rel="stylesheet" href="/collector_ui.css">
+</head>
+<body data-control-mode="keyboard">
+  <header class="app-header">
+    <div>
+      <p class="eyebrow">CLOTHTWIN DATA STUDIO</p>
+      <h1 id="scene-title">Franka 键盘采集</h1>
+    </div>
+    <div class="health-row" aria-label="系统状态">
+      <span id="connection-chip" class="chip chip-warn">服务器连接中</span>
+      <span id="mode-chip" class="chip chip-info">键盘模式</span>
+      <span id="fps-chip" class="chip">0.0 FPS</span>
+      <span id="latency-chip" class="chip">本地输入</span>
+    </div>
+  </header>
+
+  <main class="workspace">
+    <section class="card viewer-card">
+      <div class="section-heading">
+        <div><span class="step-label">LIVE VIEW</span><h2>相机画面</h2></div>
+        <p>点击画面分区放大，按 <kbd>0</kbd> 恢复四视图</p>
+      </div>
+      <canvas id="cam" width="1280" height="960" title="点击分区放大，再次点击恢复"></canvas>
+      <div id="status" class="notice notice-neutral">正在连接采集服务器…</div>
+    </section>
+
+    <aside class="card control-card">
+      <div class="section-heading">
+        <div><span class="step-label">CONTROL</span><h2>键盘控制</h2></div>
+        <span class="mode-lock">启动锁定</span>
+      </div>
+      <div class="keyboard-grid">
+        <div><kbd>↑ ↓ ← →</kbd><span>平面移动 XY</span></div>
+        <div><kbd>W / S</kbd><span>上升 / 下降</span></div>
+        <div><kbd>A / D</kbd><span>偏航 Yaw</span></div>
+        <div><kbd>Q / E</kbd><span>滚转 Roll</span></div>
+        <div><kbd>Space</kbd><span>开合夹爪</span></div>
+        <div><kbd>R</kbd><span>环境复位</span></div>
+      </div>
+      <div class="safety-note">
+        <strong>操作提示</strong>
+        <span>先用小步幅确认方向。此页面不会接收 GELLO 指令。</span>
+      </div>
+      <details class="diagnostics">
+        <summary>高级诊断</summary>
+        <p id="metrics">等待服务器指标…</p>
+        <p id="log">尚无事件</p>
+      </details>
+    </aside>
+  </main>
+
+  <section class="card parameter-card" aria-labelledby="parameter-heading">
+    <div class="section-heading parameter-heading">
+      <div><span class="step-label">SCENE &amp; PHYSICS</span><h2 id="parameter-heading">任务与参数</h2></div>
+      <span class="mode-lock">应用后安全重启</span>
+    </div>
+    <div class="parameter-toolbar">
+      <label for="scene-select">场景<select id="scene-select" disabled></select></label>
+      <div id="runtime-fields" class="runtime-fields">等待服务器配置…</div>
+    </div>
+    <div id="parameter-fields" class="parameter-fields"></div>
+    <div class="parameter-footer">
+      <p id="parameter-status" class="parameter-hint">参数只在场景构建时生效；采集中不可修改。</p>
+      <div class="parameter-actions">
+        <button id="parameter-reset" class="button button-ghost" disabled>恢复默认值</button>
+        <button id="parameter-copy" class="button button-ghost" disabled>复制配置</button>
+        <button id="parameter-apply" class="button button-primary" disabled>应用并重启</button>
+      </div>
+    </div>
+  </section>
+
+  <section class="card episode-card">
+    <div class="episode-info">
+      <label for="task">任务说明</label>
+      <input id="task" autocomplete="off" placeholder="输入本条数据的任务描述">
+      <p id="recording">空闲，可开始新 Episode</p>
+    </div>
+    <div class="episode-actions">
+      <button id="reset" class="button button-ghost">复位环境</button>
+      <button id="start" class="button button-primary">开始采集</button>
+      <button id="success" class="button button-success" disabled>成功并保存</button>
+      <button id="failure" class="button button-danger" disabled>失败并保存</button>
+      <button id="discard" class="button button-ghost-danger" disabled>丢弃</button>
+    </div>
+  </section>
+
+  <script type="module" src="/keyboard_ui.mjs"></script>
+</body>
+</html>

@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ClothTwin · GELLO 采集</title>
+  <link rel="stylesheet" href="/collector_ui.css">
+</head>
+<body data-control-mode="gello">
+  <header class="app-header">
+    <div>
+      <p class="eyebrow">CLOTHTWIN DATA STUDIO</p>
+      <h1 id="scene-title">Franka GELLO 采集</h1>
+    </div>
+    <div class="health-row" aria-label="系统状态">
+      <span id="connection-chip" class="chip chip-warn">服务器连接中</span>
+      <span id="mode-chip" class="chip chip-info">GELLO 模式</span>
+      <span id="fps-chip" class="chip">0.0 FPS</span>
+      <span id="latency-chip" class="chip chip-warn">等待 GELLO</span>
+    </div>
+  </header>
+
+  <main class="workspace">
+    <section class="card viewer-card">
+      <div class="section-heading">
+        <div><span class="step-label">LIVE VIEW</span><h2>相机画面</h2></div>
+        <p>按 <kbd>1–4</kbd> 放大视角，按 <kbd>0</kbd> 恢复</p>
+      </div>
+      <canvas id="cam" width="1280" height="960" title="点击分区放大，再次点击恢复"></canvas>
+      <div id="status" class="notice notice-neutral">正在连接采集服务器…</div>
+    </section>
+
+    <aside class="card control-card">
+      <div class="section-heading">
+        <div><span class="step-label">GUIDED SETUP</span><h2>GELLO 启动检查</h2></div>
+        <span class="mode-lock">启动锁定</span>
+      </div>
+      <ol class="setup-steps">
+        <li data-step="serial"><span>1</span><div><strong>连接串口</strong><small>Chrome/Edge · localhost · 57600 bps</small></div></li>
+        <li data-step="ids"><span>2</span><div><strong>确认 ID 1–8</strong><small>八路 raw position 持续更新</small></div></li>
+        <li data-step="home"><span>3</span><div><strong>记录机械臂 Home</strong><small>让仿真 Panda 与 GELLO 初始姿态对齐</small></div></li>
+        <li data-step="gripper"><span>4</span><div><strong>标定夹爪端点</strong><small>分别记录完全张开和闭合</small></div></li>
+        <li data-step="directions"><span>5</span><div><strong>检查关节方向</strong><small>逐关节小幅运动后确认</small></div></li>
+        <li data-step="control"><span>6</span><div><strong>启用控制</strong><small>启用后标定参数将被锁定</small></div></li>
+      </ol>
+
+      <div class="control-actions">
+        <button id="serial-connect" class="button button-primary">连接 GELLO</button>
+        <button id="serial-disconnect" class="button button-ghost" disabled>断开</button>
+        <button id="capture-home" class="button button-ghost" disabled>记录 Home</button>
+        <button id="capture-open" class="button button-ghost" disabled>记录夹爪张开</button>
+        <button id="capture-closed" class="button button-ghost" disabled>记录夹爪闭合</button>
+      </div>
+
+      <div class="direction-panel">
+        <div class="direction-title"><strong>关节方向</strong><span>反向时选择 −1</span></div>
+        <div class="joint-directions">
+          <label>J1<select data-joint-direction><option value="1">+1</option><option value="-1">−1</option></select></label>
+          <label>J2<select data-joint-direction><option value="1">+1</option><option value="-1">−1</option></select></label>
+          <label>J3<select data-joint-direction><option value="1">+1</option><option value="-1">−1</option></select></label>
+          <label>J4<select data-joint-direction><option value="1">+1</option><option value="-1">−1</option></select></label>
+          <label>J5<select data-joint-direction><option value="1">+1</option><option value="-1">−1</option></select></label>
+          <label>J6<select data-joint-direction><option value="1">+1</option><option value="-1">−1</option></select></label>
+          <label>J7<select data-joint-direction><option value="1">+1</option><option value="-1">−1</option></select></label>
+        </div>
+        <label class="check-row"><input id="directions-reviewed" type="checkbox">我已逐关节确认方向</label>
+      </div>
+
+      <div class="enable-row">
+        <button id="enable-control" class="button button-success" disabled>启用 GELLO 控制</button>
+        <button id="disable-control" class="button button-danger" disabled>停止控制</button>
+      </div>
+      <p id="serial-status" class="notice notice-neutral">等待连接 GELLO</p>
+
+      <details class="diagnostics">
+        <summary>高级诊断：raw ticks / sequence / watchdog</summary>
+        <p id="gello-raw">raw ID 1–8：等待数据</p>
+        <p id="gello-diagnostics">尚未收到 GELLO 指令</p>
+        <p id="metrics">等待服务器指标…</p>
+        <p id="log">尚无事件</p>
+      </details>
+    </aside>
+  </main>
+
+  <section class="card parameter-card" aria-labelledby="parameter-heading">
+    <div class="section-heading parameter-heading">
+      <div><span class="step-label">SCENE &amp; PHYSICS</span><h2 id="parameter-heading">任务与参数</h2></div>
+      <span class="mode-lock">应用后安全重启</span>
+    </div>
+    <div class="parameter-toolbar">
+      <label for="scene-select">场景<select id="scene-select" disabled></select></label>
+      <div id="runtime-fields" class="runtime-fields">等待服务器配置…</div>
+    </div>
+    <div id="parameter-fields" class="parameter-fields"></div>
+    <div class="parameter-footer">
+      <p id="parameter-status" class="parameter-hint">参数只在场景构建时生效；采集中不可修改。</p>
+      <div class="parameter-actions">
+        <button id="parameter-reset" class="button button-ghost" disabled>恢复默认值</button>
+        <button id="parameter-copy" class="button button-ghost" disabled>复制配置</button>
+        <button id="parameter-apply" class="button button-primary" disabled>应用并重启</button>
+      </div>
+    </div>
+  </section>
+
+  <section class="card episode-card">
+    <div class="episode-info">
+      <label for="task">任务说明</label>
+      <input id="task" autocomplete="off" placeholder="输入本条数据的任务描述">
+      <p id="recording">空闲，可开始新 Episode</p>
+    </div>
+    <div class="episode-actions">
+      <button id="reset" class="button button-ghost">复位环境</button>
+      <button id="start" class="button button-primary" disabled>开始采集</button>
+      <button id="success" class="button button-success" disabled>成功并保存</button>
+      <button id="failure" class="button button-danger" disabled>失败并保存</button>
+      <button id="discard" class="button button-ghost-danger" disabled>丢弃</button>
+    </div>
+  </section>
+
+  <script type="module" src="/gello_ui.mjs"></script>
+</body>
+</html>
