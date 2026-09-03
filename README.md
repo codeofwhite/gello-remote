@@ -60,6 +60,15 @@ checkout. Robot Data Studio launches `gello_remote.genesis_worker` for both
 keyboard and GELLO control; the historical `franka_only.*_collect` modules
 remain compatibility entry points.
 
+`gello_remote.genesis_policy_rollout` is the non-interactive policy-evaluation
+worker. It connects to an OpenPI-compatible websocket server without importing
+Robot Data Studio, converts joint7 plus gripper-closed-fraction outputs to the
+physical Franka joint8 contract, and retains the scene's joint-limit and target
+slew filters. Each bounded run records the canonical requested/safe/applied
+actions, inference timing, four RGB streams, native evaluator result, and four
+MP4 videos. A rollout succeeds only after close, release, native task success,
+and the requested number of stable target frames.
+
 ## Direct GELLO control of Isaac Sim
 
 The IsaacLab 3.0 / Isaac Sim 6.0.1 entry point consumes the same calibrated
