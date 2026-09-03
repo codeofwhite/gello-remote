@@ -23,14 +23,17 @@ function editableTarget(target) {
 }
 
 document.addEventListener("keydown", (event) => {
-  if (editableTarget(event.target) || event.repeat || pressed.has(event.code)) return;
-  if (!motionKeys.has(event.code) && !episodeKeys.has(event.code)) return;
+  if (editableTarget(event.target)) return;
+  const handled = motionKeys.has(event.code) || episodeKeys.has(event.code);
+  if (!handled) return;
+  if (motionKeys.has(event.code) || event.code === "Backspace") event.preventDefault();
+  if (event.repeat || pressed.has(event.code)) return;
   pressed.add(event.code);
   ui.send({ ...keyboardEvent("keydown", event.code), task: ui.task.value });
-  if (motionKeys.has(event.code) || event.code === "Backspace") event.preventDefault();
 });
 
 document.addEventListener("keyup", (event) => {
+  if (motionKeys.has(event.code) || event.code === "Backspace") event.preventDefault();
   if (!pressed.delete(event.code)) return;
   ui.send(keyboardEvent("keyup", event.code));
 });
