@@ -10,6 +10,7 @@ from websockets.datastructures import Headers
 from gello_remote.isaaclab_gello import (
     CAMERA_NAMES,
     CameraPreviewStore,
+    BrowserSe3KeyboardState,
     DEFAULT_CAMERA_PROFILE,
     DEFAULT_WORK_SURFACE_HEIGHT_M,
     GelloWebServer,
@@ -27,6 +28,7 @@ from gello_remote.isaaclab_gello import (
     _apply_split_gpu_launcher_config,
     _configure_gpu_selection,
     _encode_preview_packet,
+    _euler_xyz_to_rotation_vector,
     _frequency_decimation,
     _camera_intrinsic_matrix,
     _camera_profile_metadata,
@@ -35,7 +37,124 @@ from gello_remote.isaaclab_gello import (
     _load_camera_profile,
     _missing_scene_prims,
     _pump_kit_frame,
+    _running_control_services,
 )
+
+
+def keyboard_message(
+    *,
+    session_id: str = "browser-keyboard-test",
+    sequence: int = 0,
+    pressed: list[str] | None = None,
+    gripper_closed: bool = False,
+) -> dict:
+    return {
+        "type": "keyboard",
+        "version": 1,
+        "session_id": session_id,
+        "sequence": sequence,
+        "timestamp_ns": sequence + 1,
+        "pressed": pressed or [],
+        "gripper_closed": gripper_closed,
+    }
+
+
+def test_browser_keyboard_matches_official_se3_key_mapping() -> None:
+    keyboard = BrowserSe3KeyboardState(
+        position_step_m=0.01,
+        rotation_step_rad=0.05,
+        watchdog_timeout=0.3,
+        clock=lambda: 1.0,
+    )
+
+    assert keyboard.submit(
+        keyboard_message(sequence=0, pressed=["KeyW", "KeyA", "KeyQ", "KeyZ", "KeyT", "KeyC"]),
+        received_at=1.0,
+    )
+    sample = keyboard.advance(now=1.1)
+
+    expected_rotation = (0.05122917172495723, 0.04872967969036861, 0.05122917172495724)
+    assert sample.delta_pose[:3] == (0.01, 0.01, 0.01)
+    assert sample.session_id == "browser-keyboard-test"
+    assert all(
+        math.isclose(actual, expected, abs_tol=1e-12)
+        for actual, expected in zip(sample.delta_pose[3:], expected_rotation)
+    )
+    assert sample.watchdog_holding is False
+
+
+def test_keyboard_euler_conversion_matches_official_scipy_semantics() -> None:
+    rotation = _euler_xyz_to_rotation_vector((0.05, 0.05, 0.05))
+
+    assert all(
+        math.isclose(actual, expected, abs_tol=1e-12)
+        for actual, expected in zip(
+            rotation,
+            (0.05122917172495723, 0.04872967969036861, 0.05122917172495724),
+        )
+    )
+
+
+def test_browser_keyboard_full_state_stops_on_release_and_watchdog() -> None:
+    keyboard = BrowserSe3KeyboardState(
+        position_step_m=0.01,
+        rotation_step_rad=0.05,
+        watchdog_timeout=0.3,
+        clock=lambda: 1.0,
+    )
+    keyboard.submit(keyboard_message(sequence=0, pressed=["KeyS"]), received_at=1.0)
+    keyboard.submit(
+        keyboard_message(sequence=1, pressed=[], gripper_closed=True), received_at=1.1
+    )
+
+    released = keyboard.advance(now=1.2)
+    stale = keyboard.advance(now=1.5)
+
+    assert released.delta_pose == (0.0,) * 6
+    assert released.gripper_closed is True
+    assert stale.delta_pose == (0.0,) * 6
+    assert stale.watchdog_holding is True
+    assert keyboard.status(now=1.5)["watchdog_holds"] == 1
+
+
+def test_browser_keyboard_rejects_unknown_and_stale_inputs() -> None:
+    keyboard = BrowserSe3KeyboardState(
+        position_step_m=0.01,
+        rotation_step_rad=0.05,
+        watchdog_timeout=0.3,
+        clock=lambda: 1.0,
+    )
+    keyboard.submit(keyboard_message(sequence=2), received_at=1.0)
+
+    assert keyboard.submit(keyboard_message(sequence=2), received_at=1.1) is False
+    try:
+        keyboard.submit(keyboard_message(sequence=3, pressed=["KeyR"]), received_at=1.2)
+    except ValueError as exc:
+        assert "unsupported keyboard key" in str(exc)
+    else:
+        raise AssertionError("expected unknown keyboard motion key to fail")
+
+
+def test_browser_keyboard_accepts_restarted_sequence_from_new_session() -> None:
+    keyboard = BrowserSe3KeyboardState(
+        position_step_m=0.01,
+        rotation_step_rad=0.05,
+        watchdog_timeout=0.3,
+        clock=lambda: 1.0,
+    )
+    assert keyboard.submit(
+        keyboard_message(session_id="old-browser", sequence=1200), received_at=1.0
+    )
+    keyboard.release_session("old-browser")
+    assert keyboard.submit(
+        keyboard_message(session_id="new-browser", sequence=0, pressed=["KeyW"]),
+        received_at=1.1,
+    )
+
+    sample = keyboard.advance(now=1.2)
+    assert sample.session_id == "new-browser"
+    assert sample.sequence == 0
+    assert sample.delta_pose[:3] == (0.01, 0.0, 0.0)
 
 
 def test_rigid_pick_place_geometry_raises_objects_above_robot_base() -> None:
@@ -136,6 +255,35 @@ def test_preview_worker_encodes_four_views_and_stops(monkeypatch) -> None:
 
     assert len(previews.packets_since({name: -1 for name in CAMERA_NAMES})) == 4
     assert previews.stats()["encoded"] == 1
+
+
+def test_control_services_unwind_server_when_preview_start_fails() -> None:
+    events: list[str] = []
+
+    class FakeServer:
+        def start(self) -> None:
+            events.append("server.start")
+
+        def stop(self) -> None:
+            events.append("server.stop")
+
+    class FailingPreviews:
+        def start(self) -> None:
+            events.append("previews.start")
+            raise RuntimeError("preview startup failed")
+
+        def stop(self) -> None:
+            events.append("previews.stop")
+
+    try:
+        with _running_control_services(FakeServer(), FailingPreviews()):
+            raise AssertionError("control services unexpectedly started")
+    except RuntimeError as exc:
+        assert str(exc) == "preview startup failed"
+    else:
+        raise AssertionError("expected preview startup to fail")
+
+    assert events == ["server.start", "previews.start", "server.stop"]
 
 
 def test_view_commands_validate_and_keep_active_view_separate() -> None:
@@ -387,13 +535,31 @@ def test_process_request_serves_runtime_stream_config() -> None:
         stream_host="203.0.113.10",
         signaling_port=49100,
         media_port=47998,
+        control_hz=20.0,
     )
 
     response = server._process_request(connection, request)
 
     assert response.status_code == HTTPStatus.OK
     assert b'"stream_host": "203.0.113.10"' in response.body
+    assert b'"control_source": "gello"' in response.body
+    assert b'"control_hz": 20.0' in response.body
     assert response.headers["Content-Type"] == "application/json"
+
+
+def test_keyboard_server_requires_keyboard_state() -> None:
+    try:
+        GelloWebServer(
+            object(),
+            TelemetryStore(),
+            control_source="keyboard",
+            host="127.0.0.1",
+            port=18081,
+        )
+    except ValueError as exc:
+        assert "requires BrowserSe3KeyboardState" in str(exc)
+    else:
+        raise AssertionError("expected keyboard server without state to fail")
 
 
 def test_process_request_serves_built_asset_and_rejects_traversal() -> None:

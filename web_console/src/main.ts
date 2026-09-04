@@ -35,6 +35,22 @@ const videoDimensions = byId<HTMLSpanElement>("video-dimensions");
 const activeViewLabel = byId<HTMLSpanElement>("active-view-label");
 const mainDiv = byId<HTMLDivElement>("main-div");
 const video = byId<HTMLVideoElement>("remote-video");
+const controlSections = [...document.querySelectorAll<HTMLElement>("[data-control-source]")];
+let controlSource: "keyboard" | "gello" = "gello";
+let controlHz = 20;
+let keyboardHeartbeat: number | undefined;
+
+function configureControlSource(source: unknown, hz: unknown) {
+  if (source !== "keyboard" && source !== "gello") throw new Error(`Unsupported control source: ${source}`);
+  controlSource = source;
+  const parsedHz = Number(hz);
+  if (Number.isFinite(parsedHz) && parsedHz > 0) controlHz = parsedHz;
+  for (const section of controlSections) section.hidden = section.dataset.controlSource !== controlSource;
+  if (keyboardHeartbeat !== undefined) window.clearInterval(keyboardHeartbeat);
+  keyboardHeartbeat = controlSource === "keyboard"
+    ? window.setInterval(() => sendKeyboardState(), Math.max(20, Math.round(1000 / controlHz)))
+    : undefined;
+}
 
 function setStreamState(state: "connecting" | "live" | "failed", message: string, detail: string) {
   streamStatus.textContent = state === "live" ? "Live" : state === "failed" ? "Failed" : "Connecting";
@@ -58,7 +74,9 @@ async function connectStream() {
   try {
     const response = await fetch("/teleop-config.json", { cache: "no-store" });
     if (!response.ok) throw new Error(`Runtime config returned HTTP ${response.status}`);
-    const endpoint = resolveStreamConfig(await response.json(), window.location.search);
+    const runtimeConfig = await response.json();
+    configureControlSource(runtimeConfig.control_source, runtimeConfig.control_hz);
+    const endpoint = resolveStreamConfig(runtimeConfig, window.location.search);
     streamEndpoint.textContent = `WebRTC: ${endpoint.signalingServer}:${endpoint.signalingPort} / UDP ${endpoint.mediaPort}`;
     setStreamState(
       "connecting",
@@ -117,6 +135,7 @@ const saveFailureButton = byId<HTMLButtonElement>("record-failure");
 const discardRecordingButton = byId<HTMLButtonElement>("record-discard");
 const resetEnvironmentButton = byId<HTMLButtonElement>("environment-reset");
 const recordingStatusElement = byId<HTMLDivElement>("recording-status");
+const keyboardStatusElement = byId<HTMLDivElement>("keyboard-status");
 
 type PreviewName = "base" | "top" | "side" | "wrist";
 type StreamView = "free" | PreviewName;
@@ -226,6 +245,14 @@ let gripperOpen: number | null = null;
 let gripperClosed: number | null = null;
 let sequence = 0;
 let sessionId = newGelloSessionId();
+let keyboardSequence = 0;
+let keyboardSessionId = newGelloSessionId();
+let keyboardGripperClosed = false;
+const pressedKeyboardKeys = new Set<string>();
+const keyboardMotionKeys = new Set([
+  "KeyW", "KeyS", "KeyA", "KeyD", "KeyQ", "KeyE",
+  "KeyZ", "KeyX", "KeyT", "KeyG", "KeyC", "KeyV",
+]);
 
 function newGelloSessionId() {
   return globalThis.crypto?.randomUUID?.() ?? `browser-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -238,6 +265,65 @@ function calibrationReady() {
 function stopControl() {
   enableControl.checked = false;
 }
+
+function sendKeyboardState() {
+  if (controlSource !== "keyboard" || socket?.readyState !== WebSocket.OPEN) return;
+  socket.send(JSON.stringify({
+    type: "keyboard",
+    version: 1,
+    session_id: keyboardSessionId,
+    sequence: keyboardSequence++,
+    timestamp_ns: Date.now() * 1e6,
+    pressed: [...pressedKeyboardKeys].sort(),
+    gripper_closed: keyboardGripperClosed,
+  }));
+}
+
+function clearKeyboardMotion(message: string) {
+  pressedKeyboardKeys.clear();
+  keyboardStatusElement.textContent = message;
+  keyboardStatusElement.className = "status-text warning";
+  sendKeyboardState();
+}
+
+function editableTarget(target: EventTarget | null) {
+  return target instanceof HTMLElement && target.matches("input, select, button, textarea");
+}
+
+window.addEventListener("keydown", (event) => {
+  if (controlSource !== "keyboard" || editableTarget(event.target)) return;
+  const reserved = keyboardMotionKeys.has(event.code) || event.code === "KeyK" || event.code === "KeyL";
+  if (!reserved) return;
+  // Capture before the NVIDIA WebRTC video parent forwards the same key to Kit.
+  event.preventDefault();
+  event.stopPropagation();
+  if (keyboardMotionKeys.has(event.code)) {
+    if (!event.repeat) pressedKeyboardKeys.add(event.code);
+  } else if (event.code === "KeyK" && !event.repeat) {
+    keyboardGripperClosed = !keyboardGripperClosed;
+  } else if (event.code === "KeyL" && !event.repeat) {
+    pressedKeyboardKeys.clear();
+    keyboardGripperClosed = false;
+  } else {
+    return;
+  }
+  keyboardStatusElement.textContent = `Keys: ${[...pressedKeyboardKeys].join(" + ") || "idle"} | gripper: ${keyboardGripperClosed ? "closed" : "open"}`;
+  keyboardStatusElement.className = "status-text ok";
+  sendKeyboardState();
+}, { capture: true });
+
+window.addEventListener("keyup", (event) => {
+  if (controlSource !== "keyboard" || editableTarget(event.target)) return;
+  const reserved = keyboardMotionKeys.has(event.code) || event.code === "KeyK" || event.code === "KeyL";
+  if (!reserved) return;
+  event.preventDefault();
+  event.stopPropagation();
+  if (!pressedKeyboardKeys.delete(event.code)) return;
+  keyboardStatusElement.textContent = `Keys: ${[...pressedKeyboardKeys].join(" + ") || "idle"} | gripper: ${keyboardGripperClosed ? "closed" : "open"}`;
+  sendKeyboardState();
+}, { capture: true });
+
+window.addEventListener("blur", () => clearKeyboardMotion("Window lost focus; motion cleared."));
 
 function updateButtons() {
   const hasSample = rawSample !== null;
@@ -337,15 +423,15 @@ enableControl.onchange = () => {
 };
 
 function updateTelemetry(message: any) {
-  const gello = message.gello;
+  const control = message.control ?? message.gello;
   const previews = message.previews ?? {};
   if (!taskInput.dataset.sceneInitialized && message.scene_task) {
     taskInput.value = message.scene_task;
     taskInput.dataset.sceneInitialized = "true";
   }
   const previewLagged = previews.encoded > 5 && previews.actual_fps < previews.target_fps * 0.8;
-  simStatusElement.textContent = `Simulator: ${message.sim_ready ? "ready" : "starting"} | sequence: ${gello.sequence ?? "–"} | age: ${gello.age_ms ?? "–"} ms | watchdog: ${gello.watchdog_holding ? "HOLD" : "fresh"} | holds: ${gello.watchdog_holds}`;
-  simStatusElement.className = `status-text ${gello.watchdog_holding || previewLagged ? "warning" : "ok"}`;
+  simStatusElement.textContent = `Simulator: ${message.sim_ready ? "ready" : "starting"} | source: ${message.control_source ?? "gello"} | sequence: ${control.sequence ?? "–"} | age: ${control.age_ms ?? "–"} ms | watchdog: ${control.watchdog_holding ? "HOLD" : "fresh"} | holds: ${control.watchdog_holds}`;
+  simStatusElement.className = `status-text ${control.watchdog_holding || previewLagged ? "warning" : "ok"}`;
   const fingers = message.finger_positions?.map((value: number) => Number(value).toFixed(4)).join(", ") ?? "–";
   const surface = message.work_surface_top_m == null ? "–" : Number(message.work_surface_top_m).toFixed(3);
   const tcp = message.tcp_z_m == null ? "–" : Number(message.tcp_z_m).toFixed(3);
@@ -389,7 +475,13 @@ startRecordingButton.onclick = () => sendRecordingCommand("start");
 saveSuccessButton.onclick = () => sendRecordingCommand("success");
 saveFailureButton.onclick = () => sendRecordingCommand("failure");
 discardRecordingButton.onclick = () => sendRecordingCommand("discard");
-resetEnvironmentButton.onclick = () => sendRecordingCommand("reset");
+resetEnvironmentButton.onclick = () => {
+  if (controlSource === "keyboard") {
+    keyboardGripperClosed = false;
+    clearKeyboardMotion("Environment reset requested; keyboard command cleared.");
+  }
+  sendRecordingCommand("reset");
+};
 
 for (const card of previewCards) {
   const view = card.dataset.previewCamera as PreviewName;
@@ -424,6 +516,7 @@ function connectControlSocket() {
   socket.onopen = () => {
     simStatusElement.textContent = "Simulator WebSocket connected.";
     simStatusElement.className = "status-text ok";
+    sendKeyboardState();
   };
   socket.onmessage = (event) => {
     if (typeof event.data === "string") {
@@ -436,6 +529,7 @@ function connectControlSocket() {
   };
   socket.onclose = () => {
     stopControl();
+    pressedKeyboardKeys.clear();
     markPreviewsWaiting("Control socket disconnected");
     simStatusElement.textContent = "Simulator WebSocket disconnected; reconnecting…";
     simStatusElement.className = "status-text error";
@@ -453,6 +547,7 @@ setActiveView("free");
 void connectStream();
 window.setInterval(refreshPreviewFreshness, 500);
 window.addEventListener("beforeunload", () => {
+  if (keyboardHeartbeat !== undefined) window.clearInterval(keyboardHeartbeat);
   void reader.disconnect();
   for (const preview of Object.values(previewStates)) {
     if (preview.objectUrl) URL.revokeObjectURL(preview.objectUrl);

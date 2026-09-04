@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
+from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
 from http import HTTPStatus
 import json
 import math
@@ -20,7 +22,7 @@ from typing import Any
 from robot_data_contracts import CameraProfileV1, load_camera_profile
 
 from .backends import FRANKA_GRIPPER_CLOSED_M, IsaacLabFrankaBackend
-from .control import FRANKA_HOME, GelloCommandController
+from .control import FRANKA_HOME, GelloCommandController, GelloSessionGate
 from .protocol import GelloCommand
 
 
@@ -100,6 +102,210 @@ PREVIEW_WIDTH = 320
 PREVIEW_HEIGHT = 240
 PREVIEW_JPEG_QUALITY = 70
 PREVIEW_MAX_JPEG_BYTES = 256 * 1024
+CONTROL_SOURCES = ("keyboard", "gello")
+KEYBOARD_KEYS = (
+    "KeyW", "KeyS", "KeyA", "KeyD", "KeyQ", "KeyE",
+    "KeyZ", "KeyX", "KeyT", "KeyG", "KeyC", "KeyV",
+)
+KEYBOARD_AXIS_COMMANDS = {
+    "KeyW": (1.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+    "KeyS": (-1.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+    "KeyA": (0.0, 1.0, 0.0, 0.0, 0.0, 0.0),
+    "KeyD": (0.0, -1.0, 0.0, 0.0, 0.0, 0.0),
+    "KeyQ": (0.0, 0.0, 1.0, 0.0, 0.0, 0.0),
+    "KeyE": (0.0, 0.0, -1.0, 0.0, 0.0, 0.0),
+    "KeyZ": (0.0, 0.0, 0.0, 1.0, 0.0, 0.0),
+    "KeyX": (0.0, 0.0, 0.0, -1.0, 0.0, 0.0),
+    "KeyT": (0.0, 0.0, 0.0, 0.0, 1.0, 0.0),
+    "KeyG": (0.0, 0.0, 0.0, 0.0, -1.0, 0.0),
+    "KeyC": (0.0, 0.0, 0.0, 0.0, 0.0, 1.0),
+    "KeyV": (0.0, 0.0, 0.0, 0.0, 0.0, -1.0),
+}
+
+
+def _euler_xyz_to_rotation_vector(euler_xyz: tuple[float, float, float]) -> tuple[float, float, float]:
+    """Match ``scipy Rotation.from_euler('XYZ', ...).as_rotvec()`` without a new dependency."""
+    roll, pitch, yaw = (value / 2.0 for value in euler_xyz)
+    sin_x, cos_x = math.sin(roll), math.cos(roll)
+    sin_y, cos_y = math.sin(pitch), math.cos(pitch)
+    sin_z, cos_z = math.sin(yaw), math.cos(yaw)
+    quaternion_xyz = (
+        sin_x * cos_y * cos_z + cos_x * sin_y * sin_z,
+        cos_x * sin_y * cos_z - sin_x * cos_y * sin_z,
+        cos_x * cos_y * sin_z + sin_x * sin_y * cos_z,
+    )
+    quaternion_w = cos_x * cos_y * cos_z - sin_x * sin_y * sin_z
+    vector_norm = math.sqrt(sum(value * value for value in quaternion_xyz))
+    if vector_norm <= 1e-12:
+        return (0.0, 0.0, 0.0)
+    angle = 2.0 * math.atan2(vector_norm, quaternion_w)
+    return tuple(value * angle / vector_norm for value in quaternion_xyz)
+
+
+@dataclass(frozen=True)
+class BrowserKeyboardCommand:
+    """Validated browser state matching Isaac Lab's ``Se3Keyboard`` contract."""
+
+    session_id: str
+    sequence: int
+    timestamp_ns: int
+    pressed: tuple[str, ...]
+    gripper_closed: bool
+
+
+@dataclass(frozen=True)
+class BrowserKeyboardSample:
+    """One task-space keyboard sample with source provenance."""
+
+    delta_pose: tuple[float, ...]
+    gripper_closed: bool
+    session_id: str | None
+    sequence: int | None
+    source_timestamp_ns: int | None
+    receive_timestamp_ns: int | None
+    watchdog_holding: bool
+
+
+class BrowserSe3KeyboardState:
+    """Thread-safe browser transport for the official Isaac Lab SE(3) key map."""
+
+    def __init__(
+        self,
+        *,
+        position_step_m: float,
+        rotation_step_rad: float,
+        watchdog_timeout: float,
+        clock=time.monotonic,
+    ) -> None:
+        parameters = (position_step_m, rotation_step_rad, watchdog_timeout)
+        if not all(math.isfinite(value) and value > 0 for value in parameters):
+            raise ValueError("keyboard steps and watchdog timeout must be positive")
+        self._position_step_m = float(position_step_m)
+        self._rotation_step_rad = float(rotation_step_rad)
+        self._watchdog_timeout = float(watchdog_timeout)
+        self._clock = clock
+        self._gate = GelloSessionGate(watchdog_timeout, clock=clock)
+        self._lock = threading.Lock()
+        self._latest: BrowserKeyboardCommand | None = None
+        self._received_at: float | None = None
+        self._watchdog_holding = False
+        self._watchdog_holds = 0
+        self._accepted_commands = 0
+        self._rejected_commands = 0
+
+    @staticmethod
+    def _validate(data: dict[str, Any]) -> BrowserKeyboardCommand:
+        if data.get("type") != "keyboard" or data.get("version") != 1:
+            raise ValueError("keyboard command requires type='keyboard' and version=1")
+        session_id = data.get("session_id")
+        sequence = data.get("sequence")
+        timestamp_ns = data.get("timestamp_ns")
+        pressed = data.get("pressed")
+        gripper_closed = data.get("gripper_closed")
+        if not isinstance(session_id, str) or not session_id.strip() or len(session_id) > 128:
+            raise ValueError("keyboard session_id must be a non-empty string")
+        if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 0:
+            raise ValueError("keyboard sequence must be a non-negative integer")
+        if isinstance(timestamp_ns, bool) or not isinstance(timestamp_ns, int) or timestamp_ns <= 0:
+            raise ValueError("keyboard timestamp_ns must be a positive integer")
+        if not isinstance(pressed, list) or any(not isinstance(key, str) for key in pressed):
+            raise ValueError("keyboard pressed must be a list of key codes")
+        unknown = sorted(set(pressed) - set(KEYBOARD_KEYS))
+        if unknown:
+            raise ValueError(f"unsupported keyboard key: {', '.join(unknown)}")
+        if len(pressed) != len(set(pressed)):
+            raise ValueError("keyboard pressed keys must be unique")
+        if not isinstance(gripper_closed, bool):
+            raise ValueError("keyboard gripper_closed must be boolean")
+        return BrowserKeyboardCommand(
+            session_id=session_id,
+            sequence=sequence,
+            timestamp_ns=timestamp_ns,
+            pressed=tuple(pressed),
+            gripper_closed=gripper_closed,
+        )
+
+    def submit(self, data: dict[str, Any], *, received_at: float | None = None) -> bool:
+        command = self._validate(data)
+        now = self._clock() if received_at is None else float(received_at)
+        if not math.isfinite(now):
+            raise ValueError("received_at must be finite")
+        with self._lock:
+            if not self._gate.accept(command, received_at=now):
+                self._rejected_commands += 1
+                return False
+            self._latest = command
+            self._received_at = now
+            self._watchdog_holding = False
+            self._accepted_commands += 1
+            return True
+
+    def release_session(self, session_id: str) -> None:
+        with self._lock:
+            self._gate.release(session_id)
+            if self._latest is not None and self._latest.session_id == session_id:
+                self._latest = None
+                self._received_at = None
+
+    def reset(self) -> None:
+        with self._lock:
+            self._latest = None
+            self._received_at = None
+            self._watchdog_holding = False
+
+    def advance(self, *, now: float | None = None) -> BrowserKeyboardSample:
+        current_time = self._clock() if now is None else float(now)
+        with self._lock:
+            fresh = (
+                self._latest is not None
+                and self._received_at is not None
+                and current_time - self._received_at <= self._watchdog_timeout
+            )
+            if not fresh and self._received_at is not None and not self._watchdog_holding:
+                self._watchdog_holding = True
+                self._watchdog_holds += 1
+            command = self._latest
+            axes = [0.0] * 6
+            if fresh and command is not None:
+                for key in command.pressed:
+                    for index, value in enumerate(KEYBOARD_AXIS_COMMANDS[key]):
+                        axes[index] += value
+                axes[:3] = [value * self._position_step_m for value in axes[:3]]
+                euler_xyz = tuple(value * self._rotation_step_rad for value in axes[3:])
+                axes[3:] = _euler_xyz_to_rotation_vector(euler_xyz)
+            return BrowserKeyboardSample(
+                delta_pose=tuple(axes),
+                gripper_closed=command.gripper_closed if command is not None else False,
+                session_id=command.session_id if command is not None else None,
+                sequence=command.sequence if command is not None else None,
+                source_timestamp_ns=command.timestamp_ns if command is not None else None,
+                receive_timestamp_ns=(
+                    int(self._received_at * 1e9) if self._received_at is not None else None
+                ),
+                watchdog_holding=self._watchdog_holding,
+            )
+
+    def status(self, *, now: float | None = None) -> dict[str, object]:
+        sample = self.advance(now=now)
+        current_time = self._clock() if now is None else float(now)
+        with self._lock:
+            age_ms = (
+                max(0.0, current_time - self._received_at) * 1000.0
+                if self._received_at is not None
+                else None
+            )
+            return {
+                "sequence": sample.sequence,
+                "session_id": self._gate.active_session_id,
+                "age_ms": round(age_ms, 1) if age_ms is not None else None,
+                "watchdog_holding": sample.watchdog_holding,
+                "watchdog_holds": self._watchdog_holds,
+                "accepted_commands": self._accepted_commands,
+                "rejected_commands": self._rejected_commands,
+                "pressed": list(self._latest.pressed) if self._latest is not None else [],
+                "gripper_closed": sample.gripper_closed,
+                "delta_pose": list(sample.delta_pose),
+            }
 
 
 def _validate_work_surface_height(value: float) -> float:
@@ -663,7 +869,7 @@ class CameraPreviewStore:
 
 
 class GelloWebServer:
-    """Serve the Isaac Collector page and receive its direct GELLO commands."""
+    """Serve the Isaac Collector page and receive its selected control source."""
 
     def __init__(
         self,
@@ -672,15 +878,24 @@ class GelloWebServer:
         recording: RecordingCommandStore | None = None,
         previews: CameraPreviewStore | None = None,
         views: ViewCommandStore | None = None,
+        keyboard: BrowserSe3KeyboardState | None = None,
         *,
+        control_source: str = "gello",
         host: str,
         port: int,
         stream_host: str = "",
         signaling_port: int = 49100,
         media_port: int = 47998,
         stream_fps: int = 30,
+        control_hz: float = 20.0,
     ) -> None:
+        if control_source not in CONTROL_SOURCES:
+            raise ValueError(f"unsupported control source: {control_source}")
+        if control_source == "keyboard" and keyboard is None:
+            raise ValueError("keyboard control requires BrowserSe3KeyboardState")
         self._controller = controller
+        self._keyboard = keyboard
+        self._control_source = control_source
         self._telemetry = telemetry
         self._recording = recording or RecordingCommandStore()
         self._previews = previews or CameraPreviewStore()
@@ -691,6 +906,7 @@ class GelloWebServer:
         self._signaling_port = signaling_port
         self._media_port = media_port
         self._stream_fps = stream_fps
+        self._control_hz = control_hz
         self._thread: threading.Thread | None = None
         self._server = None
         self._ready = threading.Event()
@@ -713,9 +929,17 @@ class GelloWebServer:
         response.headers[name] = value
 
     def _status_payload(self, *, log: str | None = None) -> str:
+        selected_status = (
+            self._keyboard.status()
+            if self._control_source == "keyboard" and self._keyboard is not None
+            else self._controller.status()
+        )
         payload = {
             "type": "status",
             "backend": "isaaclab",
+            "control_source": self._control_source,
+            "control": selected_status,
+            # Retained for existing GELLO clients while the UI migrates to ``control``.
             "gello": self._controller.status(),
             "recording": self._recording.snapshot(),
             "previews": self._previews.stats(),
@@ -730,7 +954,7 @@ class GelloWebServer:
         from websockets.exceptions import ConnectionClosed
 
         sent_versions = {camera_name: -1 for camera_name in PREVIEW_CAMERA_IDS}
-        bound_gello_session_id: str | None = None
+        bound_control_session_id: str | None = None
 
         def send_updates(*, log: str | None = None) -> None:
             websocket.send(self._status_payload(log=log))
@@ -753,14 +977,27 @@ class GelloWebServer:
                     data = json.loads(message)
                     message_type = data.get("type")
                     if message_type == "gello":
+                        if self._control_source != "gello":
+                            raise ValueError("GELLO commands are disabled in keyboard mode")
                         command = GelloCommand.model_validate(data)
                         accepted = self._controller.submit(command)
                         if accepted:
-                            bound_gello_session_id = command.session_id
+                            bound_control_session_id = command.session_id
                         log = (
                             f"Accepted GELLO sequence {command.sequence}"
                             if accepted
                             else f"Ignored stale or competing GELLO sequence {command.sequence}"
+                        )
+                    elif message_type == "keyboard":
+                        if self._control_source != "keyboard" or self._keyboard is None:
+                            raise ValueError("keyboard commands are disabled in GELLO mode")
+                        accepted = self._keyboard.submit(data)
+                        if accepted:
+                            bound_control_session_id = str(data["session_id"])
+                        log = (
+                            f"Accepted keyboard sequence {data['sequence']}"
+                            if accepted
+                            else f"Ignored stale or competing keyboard sequence {data['sequence']}"
                         )
                     elif message_type == "command":
                         command_name = data.get("command")
@@ -776,15 +1013,20 @@ class GelloWebServer:
                         self._views.submit(view_name)
                         log = f"Queued stream view {view_name}"
                     else:
-                        raise ValueError("expected message type 'gello', 'command', or 'view'")
+                        raise ValueError(
+                            "expected message type 'gello', 'keyboard', 'command', or 'view'"
+                        )
                 except (json.JSONDecodeError, TypeError, ValueError) as exc:
                     log = f"ERROR: {exc}"
                 send_updates(log=log)
         except ConnectionClosed:
             return
         finally:
-            if bound_gello_session_id is not None:
-                self._controller.release_session(bound_gello_session_id)
+            if bound_control_session_id is not None:
+                if self._control_source == "keyboard" and self._keyboard is not None:
+                    self._keyboard.release_session(bound_control_session_id)
+                else:
+                    self._controller.release_session(bound_control_session_id)
 
     def _process_request(self, connection, request):
         if "Upgrade" in request.headers:
@@ -805,6 +1047,8 @@ class GelloWebServer:
                         "width": STREAM_WIDTH,
                         "height": STREAM_HEIGHT,
                         "fps": self._stream_fps,
+                        "control_source": self._control_source,
+                        "control_hz": self._control_hz,
                     }
                 ),
             )
@@ -864,6 +1108,22 @@ class GelloWebServer:
                 raise RuntimeError("GELLO WebSocket server did not stop cleanly")
 
 
+@contextmanager
+def _running_control_services(
+    web_server: GelloWebServer, previews: CameraPreviewStore
+):
+    """Start control services and unwind each successful acquisition in reverse order."""
+    web_server.start()
+    try:
+        previews.start()
+        try:
+            yield
+        finally:
+            previews.stop()
+    finally:
+        web_server.stop()
+
+
 def _parse_args() -> tuple[argparse.Namespace, object]:
     from isaaclab.app import AppLauncher
 
@@ -877,6 +1137,12 @@ def _parse_args() -> tuple[argparse.Namespace, object]:
             )
 
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--control-source",
+        choices=CONTROL_SOURCES,
+        default="gello",
+        help="lock the Collector to browser keyboard or GELLO input",
+    )
     parser.add_argument("--host", default="127.0.0.1", help="HTTP/WebSocket bind host")
     parser.add_argument("--port", type=int, default=18081, help="HTTP/WebSocket bind port")
     parser.add_argument(
@@ -912,7 +1178,19 @@ def _parse_args() -> tuple[argparse.Namespace, object]:
         help="physical GPU index from nvidia-smi; configures simulation, PhysX, and RTX together",
     )
     parser.add_argument("--physics_hz", type=float, default=120.0, help="physics frequency [Hz]")
-    parser.add_argument("--control_hz", type=float, default=20.0, help="GELLO control frequency [Hz]")
+    parser.add_argument("--control_hz", type=float, default=20.0, help="teleoperation control frequency [Hz]")
+    parser.add_argument(
+        "--keyboard-position-step-m",
+        type=float,
+        default=0.01,
+        help="official Se3Keyboard-style translation increment per control tick [m]",
+    )
+    parser.add_argument(
+        "--keyboard-rotation-step-rad",
+        type=float,
+        default=0.05,
+        help="official Se3Keyboard-style rotation increment per control tick [rad]",
+    )
     parser.add_argument(
         "--dataset-fps",
         type=float,
@@ -952,6 +1230,8 @@ def _parse_args() -> tuple[argparse.Namespace, object]:
         args.stream_fps,
         args.max_joint_speed,
         args.gello_timeout,
+        args.keyboard_position_step_m,
+        args.keyboard_rotation_step_rad,
     ) <= 0:
         parser.error("physics, control, speed, and timeout values must be positive")
     if args.smoke_steps < 0:
@@ -1000,6 +1280,8 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
     import torch
     import isaaclab.sim as sim_utils
     from isaaclab.assets import Articulation, RigidObject, RigidObjectCfg
+    from isaaclab.controllers import DifferentialIKController, DifferentialIKControllerCfg
+    from isaaclab.utils.math import subtract_frame_transforms
     from isaaclab_assets import FRANKA_PANDA_HIGH_PD_CFG
 
     sim_dt = 1.0 / args.physics_hz
@@ -1179,15 +1461,60 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
         max_joint_speed=args.max_joint_speed,
         watchdog_timeout=args.gello_timeout,
     )
+    keyboard = BrowserSe3KeyboardState(
+        position_step_m=args.keyboard_position_step_m,
+        rotation_step_rad=args.keyboard_rotation_step_rad,
+        watchdog_timeout=args.gello_timeout,
+    )
+    diff_ik_controller = DifferentialIKController(
+        DifferentialIKControllerCfg(
+            command_type="pose", use_relative_mode=True, ik_method="dls"
+        ),
+        num_envs=1,
+        device=sim.device,
+    )
+    arm_joint_ids = robot.find_joints(
+        [f"panda_joint{index}" for index in range(1, 8)], preserve_order=True
+    )[0]
+    hand_body_index = robot.find_bodies("panda_hand")[0][0]
+    hand_jacobian_index = hand_body_index - 1 if robot.is_fixed_base else hand_body_index
+    jacobian_joint_ids = [index + robot.num_base_dofs for index in arm_joint_ids]
+
+    def keyboard_joint_targets(
+        sample: BrowserKeyboardSample, hold_targets: tuple[float, ...]
+    ) -> tuple[float, ...]:
+        """Map an official-style relative SE(3) command through Isaac Lab DLS IK."""
+        if not any(sample.delta_pose):
+            return hold_targets
+        ee_pose_w = robot.data.body_pose_w.torch[:, hand_body_index]
+        root_pose_w = robot.data.root_pose_w.torch
+        ee_pos_b, ee_quat_b = subtract_frame_transforms(
+            root_pose_w[:, :3], root_pose_w[:, 3:7], ee_pose_w[:, :3], ee_pose_w[:, 3:7]
+        )
+        command = torch.tensor(
+            [sample.delta_pose], dtype=torch.float32, device=sim.device
+        )
+        diff_ik_controller.set_command(command, ee_pos_b, ee_quat_b)
+        jacobian = robot.data.body_link_jacobian_w.torch[
+            :, hand_jacobian_index, :, jacobian_joint_ids
+        ]
+        joint_pos = robot.data.joint_pos.torch[:, arm_joint_ids]
+        desired = diff_ik_controller.compute(
+            ee_pos_b, ee_quat_b, jacobian, joint_pos
+        )
+        if not bool(torch.isfinite(desired).all().item()):
+            raise RuntimeError("Differential IK produced a non-finite Franka target")
+        return tuple(float(value) for value in desired[0].detach().cpu().tolist())
+
     telemetry = TelemetryStore()
     scene_task = (
         str(scene_geometry["task_instruction"])
         if scene_geometry is not None
-        else "Move the Franka safely with GELLO"
+        else f"Move the Franka safely with {args.control_source}"
     )
-    hand_body_index = robot.find_bodies("panda_hand")[0][0]
     telemetry.update(
         sim_ready=True,
+        control_source=args.control_source,
         scene_id=args.scene,
         scene_task=scene_task,
         work_surface_top_m=work_surface_top_m,
@@ -1217,6 +1544,17 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
             "target_joint_position/panda_finger_joint1_m",
             "target_joint_position/panda_finger_joint2_m",
         ]
+        control_source = (
+            "browser_se3_keyboard"
+            if args.control_source == "keyboard"
+            else "gello_joint_targets"
+        )
+        operator_command_names = (
+            ["dx_m", "dy_m", "dz_m", "droll_rad", "dpitch_rad", "dyaw_rad", "gripper_closed"]
+            if args.control_source == "keyboard"
+            else [f"requested_joint_position/panda_joint{index}_rad" for index in range(1, 8)]
+            + ["requested_gripper_closed"]
+        )
         writer = FrankaEpisodeWriter(
             args.data_dir,
             fps=int(round(args.dataset_fps)),
@@ -1225,17 +1563,35 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
             scene_id=args.scene,
             seed=args.seed,
             worker_id="gello_remote_isaac_sim",
-            control_source="gello_joint_targets",
+            control_source=control_source,
             state_names=state_names,
             action_names=action_names,
-            operator_command_names=[f"requested_joint_position/panda_joint{index}_rad" for index in range(1, 8)]
-            + ["requested_gripper_closed"],
+            operator_command_names=operator_command_names,
             camera_names=list(CAMERA_NAMES),
             run_metadata={
                 "isaaclab_device": args.device,
                 "gpu_id": args.gpu_id,
                 "physics_hz": args.physics_hz,
                 "control_hz": args.control_hz,
+                "control_source": control_source,
+                "control_source_options": ["browser_se3_keyboard", "gello_joint_targets"],
+                "operator_command_layouts": {
+                    "browser_se3_keyboard": operator_command_names
+                    if args.control_source == "keyboard"
+                    else ["dx_m", "dy_m", "dz_m", "droll_rad", "dpitch_rad", "dyaw_rad", "gripper_closed"],
+                    "gello_joint_targets": [
+                        *[f"panda_joint{index}_rad" for index in range(1, 8)],
+                        "gripper_closed",
+                    ],
+                },
+                "keyboard_mapping": KEYBOARD_AXIS_COMMANDS,
+                "keyboard_position_step_m": args.keyboard_position_step_m,
+                "keyboard_rotation_step_rad": args.keyboard_rotation_step_rad,
+                "keyboard_ik": {
+                    "command_type": "pose",
+                    "use_relative_mode": True,
+                    "method": "dls",
+                },
                 "dataset_fps": args.dataset_fps,
                 "preview_fps": args.preview_fps,
                 "stream_fps": args.stream_fps,
@@ -1262,25 +1618,51 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
         recording,
         previews,
         views,
+        keyboard,
+        control_source=args.control_source,
         host=args.host,
         port=args.port,
         stream_host=args.stream_host,
         signaling_port=args.signaling_port,
         media_port=args.media_port,
         stream_fps=args.stream_fps,
+        control_hz=args.control_hz,
     )
-    if args.smoke_steps == 0:
-        web_server.start()
-        previews.start()
-        print(f"GELLO Isaac control UI: http://{args.host}:{args.port}", file=sys.__stderr__, flush=True)
-
     physics_step = 0
     control_step = 0
     control_tick_ms: deque[float] = deque(maxlen=max(20, int(round(args.control_hz * 5))))
     control_tick_times: deque[float] = deque(maxlen=max(20, int(round(args.control_hz * 5))))
     safe_command = controller.tick(now=0.0) if args.smoke_steps else controller.tick()
+    keyboard_sample = keyboard.advance()
+    last_keyboard_command: tuple[str, int] | None = None
     target_at_watchdog: tuple[float, ...] | None = None
+    initial_tcp_position = tuple(
+        float(value)
+        for value in robot.data.body_pos_w.torch[0, hand_body_index].detach().cpu().tolist()
+    )
+    services = (
+        _running_control_services(web_server, previews)
+        if args.smoke_steps == 0
+        else nullcontext()
+    )
+    services_entered = False
     try:
+        services.__enter__()
+        services_entered = True
+        if args.smoke_steps == 0:
+            print(
+                "ISAAC_CONTROL_READY "
+                + json.dumps(
+                    {
+                        "control_source": args.control_source,
+                        "host": args.host,
+                        "port": args.port,
+                    },
+                    sort_keys=True,
+                ),
+                file=sys.__stderr__,
+                flush=True,
+            )
         while simulation_app.is_running():
             simulated_time = physics_step * sim_dt
             if physics_step % control_decimation == 0:
@@ -1293,6 +1675,8 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                                     raise RuntimeError("an episode is already recording")
                                 reset_task_assets()
                                 controller.reset_targets(initial_joint_positions)
+                                keyboard.reset()
+                                diff_ik_controller.reset()
                                 episode_index = writer.start(task)
                                 recording.update(
                                     recording=True,
@@ -1331,6 +1715,8 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                                     raise RuntimeError("finish or discard the active episode before reset")
                                 reset_task_assets()
                                 controller.reset_targets(initial_joint_positions)
+                                keyboard.reset()
+                                diff_ik_controller.reset()
                                 recording.update(error=None, last_event="Environment reset")
                         except (OSError, RuntimeError, ValueError) as exc:
                             recording.update(error=str(exc), last_event=f"ERROR: {exc}")
@@ -1349,17 +1735,62 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                         views.activate(view_name, camera_path)
                         telemetry.update(viewport_camera=camera_path, view_error=None)
                 if args.smoke_steps and control_step == 0:
-                    smoke_targets = list(initial_joint_positions)
-                    smoke_targets[0] += 0.03
-                    controller.submit(
-                        GelloCommand(
-                            sequence=0,
-                            timestamp_ns=1,
-                            joint_targets=smoke_targets,
-                            gripper_closed=True,
-                        ),
-                        received_at=simulated_time,
+                    if args.control_source == "keyboard":
+                        keyboard.submit(
+                            {
+                                "type": "keyboard",
+                                "version": 1,
+                                "session_id": "keyboard-smoke",
+                                "sequence": 0,
+                                "timestamp_ns": 1,
+                                "pressed": ["KeyW"],
+                                "gripper_closed": True,
+                            },
+                            received_at=simulated_time,
+                        )
+                    else:
+                        smoke_targets = list(initial_joint_positions)
+                        smoke_targets[0] += 0.03
+                        controller.submit(
+                            GelloCommand(
+                                sequence=0,
+                                timestamp_ns=1,
+                                joint_targets=smoke_targets,
+                                gripper_closed=True,
+                            ),
+                            received_at=simulated_time,
+                        )
+                if args.control_source == "keyboard":
+                    keyboard_sample = keyboard.advance(
+                        now=simulated_time if args.smoke_steps else None
                     )
+                    keyboard_command = (
+                        (keyboard_sample.session_id, keyboard_sample.sequence)
+                        if keyboard_sample.session_id is not None
+                        and keyboard_sample.sequence is not None
+                        else None
+                    )
+                    if (
+                        not keyboard_sample.watchdog_holding
+                        and keyboard_command is not None
+                        and keyboard_command != last_keyboard_command
+                    ):
+                        requested_joint_targets = keyboard_joint_targets(
+                            keyboard_sample, safe_command.joint_targets
+                        )
+                        controller.submit(
+                            GelloCommand(
+                                session_id="browser-keyboard-ik",
+                                # The browser sequence restarts after a reload. Use the
+                                # monotonic simulator tick for this internal controller hop.
+                                sequence=control_step,
+                                timestamp_ns=keyboard_sample.source_timestamp_ns,
+                                joint_targets=requested_joint_targets,
+                                gripper_closed=keyboard_sample.gripper_closed,
+                            ),
+                            received_at=simulated_time if args.smoke_steps else None,
+                        )
+                        last_keyboard_command = keyboard_command
                 safe_command = controller.tick(now=simulated_time) if args.smoke_steps else controller.tick()
                 recording_active = writer is not None and writer.is_recording
                 dataset_due = (
@@ -1405,7 +1836,11 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                         dtype=np.float32,
                     )
                     operator_command = np.asarray(
-                        (*safe_command.requested_joint_targets, float(safe_command.gripper_closed)),
+                        (
+                            (*keyboard_sample.delta_pose, float(keyboard_sample.gripper_closed))
+                            if args.control_source == "keyboard"
+                            else (*safe_command.requested_joint_targets, float(safe_command.gripper_closed))
+                        ),
                         dtype=np.float32,
                     )
                     backend.set_command(
@@ -1504,9 +1939,8 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
     finally:
         if writer is not None and writer.is_recording:
             writer.discard()
-        if args.smoke_steps == 0:
-            web_server.stop()
-            previews.stop()
+        if services_entered:
+            services.__exit__(*sys.exc_info())
 
     if args.smoke_steps:
         actual_joint_positions = backend.current_joint_positions()
@@ -1517,9 +1951,20 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
         finger_error = max(abs(value - FRANKA_GRIPPER_CLOSED_M) for value in finger_positions)
         controller_status = controller.status(now=physics_step * sim_dt)
         target_held = target_at_watchdog == safe_command.joint_targets
+        final_tcp_position = tuple(
+            float(value)
+            for value in robot.data.body_pos_w.torch[0, hand_body_index].detach().cpu().tolist()
+        )
+        tcp_x_gain = final_tcp_position[0] - initial_tcp_position[0]
+        motion_passed = (
+            tcp_x_gain >= 0.005
+            if args.control_source == "keyboard"
+            else actual_joint_positions[0] - initial_joint_positions[0] >= 0.015
+        )
         report = {
+            "control_source": args.control_source,
             "passed": (
-                actual_joint_positions[0] - initial_joint_positions[0] >= 0.015
+                motion_passed
                 and final_tracking_error <= 0.02
                 and finger_error <= 0.005
                 and controller_status["watchdog_holds"] == 1
@@ -1529,6 +1974,7 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
             "initial_j1_rad": initial_joint_positions[0],
             "actual_j1_rad": actual_joint_positions[0],
             "j1_gain_rad": actual_joint_positions[0] - initial_joint_positions[0],
+            "tcp_x_gain_m": tcp_x_gain,
             "max_tracking_error_rad": final_tracking_error,
             "finger_positions_m": list(finger_positions),
             "finger_error_m": finger_error,

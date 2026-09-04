@@ -3,9 +3,9 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>GELLO → Isaac Sim</title>
-    <script type="module" crossorigin src="/assets/index-DzMHDOIs.js"></script>
-    <link rel="stylesheet" crossorigin href="/assets/index-tsBWFjb4.css">
+    <title>Robot Data Studio · Isaac Sim Teleoperation</title>
+    <script type="module" crossorigin src="/assets/index-CeHRyTP4.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-Vvr_5QNX.css">
   </head>
   <body>
     <main class="console-shell">
@@ -95,8 +95,8 @@
         </footer>
       </section>
 
-      <aside class="control-panel" aria-label="GELLO controls">
-        <section class="panel-section">
+      <aside class="control-panel" aria-label="Isaac Sim teleoperation controls">
+        <section class="panel-section" data-control-source="gello">
           <h1>GELLO → Franka</h1>
           <p>Direct 7-DOF joint targets with independent gripper control.</p>
           <div class="button-row">
@@ -106,7 +106,7 @@
           <div id="serial-status" class="status-text">Web Serial idle — use desktop Chrome/Edge on localhost.</div>
         </section>
 
-        <section class="panel-section">
+        <section class="panel-section" data-control-source="gello">
           <h2>Calibration</h2>
           <div class="button-grid">
             <button id="capture-home" disabled>Capture arm home</button>
@@ -126,11 +126,27 @@
           <div id="raw" class="raw-values">Raw ID 1–8: waiting</div>
         </section>
 
+        <section class="panel-section" data-control-source="keyboard" hidden>
+          <h1>Keyboard → Franka</h1>
+          <p>Isaac Lab Se3Keyboard semantics: relative end-effector pose through damped least-squares IK.</p>
+          <div class="keyboard-grid" aria-label="Isaac Lab keyboard map">
+            <div><kbd>W / S</kbd><span>X translation</span></div>
+            <div><kbd>A / D</kbd><span>Y translation</span></div>
+            <div><kbd>Q / E</kbd><span>Z translation</span></div>
+            <div><kbd>Z / X</kbd><span>Roll</span></div>
+            <div><kbd>T / G</kbd><span>Pitch</span></div>
+            <div><kbd>C / V</kbd><span>Yaw</span></div>
+            <div><kbd>K</kbd><span>Toggle gripper</span></div>
+            <div><kbd>L</kbd><span>Reset command</span></div>
+          </div>
+          <div id="keyboard-status" class="status-text warning">Click outside a form field to enable keyboard control.</div>
+        </section>
+
         <section class="panel-section telemetry-section">
           <h2>Episode recording</h2>
           <label class="task-field">
             Task instruction
-            <input id="episode-task" value="Move the Franka safely with GELLO" />
+            <input id="episode-task" value="Move the Franka safely" />
           </label>
           <div class="button-grid">
             <button id="record-start">Start Episode</button>
