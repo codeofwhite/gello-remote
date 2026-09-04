@@ -1708,7 +1708,7 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                     "side": "virtual auxiliary side-view height and contact",
                     "wrist": "Franka panda_hand wrist view",
                 },
-                "automatic_outcome_available": False,
+                "automatic_outcome_available": cube_lift_evaluator is not None,
                 "scene_geometry": scene_geometry,
                 "git_roots": {"gello_remote": Path(__file__).resolve().parents[2]},
                 "dependency_packages": ["isaacsim", "numpy"],
