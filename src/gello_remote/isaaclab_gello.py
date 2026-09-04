@@ -590,6 +590,17 @@ def _missing_scene_prims(
     return missing
 
 
+def _required_scene_prims(scene_geometry: dict[str, object] | None) -> tuple[str, ...]:
+    """Return only the USD prims declared by the selected scene geometry."""
+    required = STREAM_SCENE_PRIMS
+    if scene_geometry is None:
+        return required
+    required += ("/World/WorkSurface", "/World/TaskObject")
+    if "target_size_m" in scene_geometry:
+        required += ("/World/TargetZone",)
+    return required
+
+
 def _configure_stream_view(
     *,
     camera_target: tuple[float, float, float] = STREAM_CAMERA_TARGET,
@@ -1527,12 +1538,9 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
 
     scene_status: dict[str, object] = {}
     if args.smoke_steps == 0:
-        required_prims = STREAM_SCENE_PRIMS
-        if scene_geometry is not None:
-            required_prims += ("/World/WorkSurface", "/World/TaskObject", "/World/TargetZone")
         scene_status = _configure_stream_view(
             camera_target=stream_camera_target,
-            required_prims=required_prims,
+            required_prims=_required_scene_prims(scene_geometry),
         )
         # Publish the newly-bound camera and populated stage before accepting a browser client.
         _pump_kit_frame(simulation_app)

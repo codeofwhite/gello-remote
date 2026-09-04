@@ -39,6 +39,7 @@ from gello_remote.isaaclab_gello import (
     _load_camera_profile,
     _missing_scene_prims,
     _pump_kit_frame,
+    _required_scene_prims,
     _running_control_services,
 )
 
@@ -183,6 +184,21 @@ def test_rigid_cube_lift_geometry_has_no_placement_target() -> None:
     assert "target_center_m" not in geometry
     assert geometry["evaluator"]["lift_threshold_m"] == 0.08
     assert "hold for 1 second" in geometry["task_instruction"]
+
+
+def test_pick_place_stream_validation_requires_target_zone() -> None:
+    geometry = _rigid_pick_place_geometry(DEFAULT_WORK_SURFACE_HEIGHT_M)
+
+    assert "/World/TargetZone" in _required_scene_prims(geometry)
+
+
+def test_cube_lift_stream_validation_does_not_require_target_zone() -> None:
+    geometry = _rigid_cube_lift_geometry(DEFAULT_WORK_SURFACE_HEIGHT_M)
+
+    required = _required_scene_prims(geometry)
+    assert "/World/WorkSurface" in required
+    assert "/World/TaskObject" in required
+    assert "/World/TargetZone" not in required
 
 
 def test_cube_lift_evaluator_requires_close_lift_hold_and_release() -> None:
