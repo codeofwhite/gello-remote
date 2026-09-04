@@ -11,6 +11,7 @@ from gello_remote.isaaclab_gello import (
     CAMERA_NAMES,
     CameraPreviewStore,
     BrowserSe3KeyboardState,
+    CubeLiftEvaluator,
     DEFAULT_CAMERA_PROFILE,
     DEFAULT_WORK_SURFACE_HEIGHT_M,
     GelloWebServer,
@@ -33,6 +34,7 @@ from gello_remote.isaaclab_gello import (
     _camera_intrinsic_matrix,
     _camera_profile_metadata,
     _rigid_pick_place_geometry,
+    _rigid_cube_lift_geometry,
     _scene_camera_overrides,
     _load_camera_profile,
     _missing_scene_prims,
@@ -172,6 +174,48 @@ def test_rigid_pick_place_geometry_raises_objects_above_robot_base() -> None:
             assert "work-surface-height-m" in str(exc)
         else:
             raise AssertionError("expected invalid work surface height")
+
+
+def test_rigid_cube_lift_geometry_has_no_placement_target() -> None:
+    geometry = _rigid_cube_lift_geometry(DEFAULT_WORK_SURFACE_HEIGHT_M)
+
+    assert geometry["object_start_m"] == (0.55, -0.10, 0.277)
+    assert "target_center_m" not in geometry
+    assert geometry["evaluator"]["lift_threshold_m"] == 0.08
+    assert "hold for 1 second" in geometry["task_instruction"]
+
+
+def test_cube_lift_evaluator_requires_close_lift_hold_and_release() -> None:
+    evaluator = CubeLiftEvaluator(fps=10, initial_object_z_m=0.277)
+
+    evaluator.update(object_z_m=0.277, gripper_closed=False)
+    evaluator.update(object_z_m=0.367, gripper_closed=True)
+    assert evaluator.result()["success"] is False
+
+    for _ in range(9):
+        evaluator.update(object_z_m=0.367, gripper_closed=True)
+    assert evaluator.result()["max_hold_frames"] == 10
+    assert evaluator.result()["success"] is False
+
+    evaluator.update(object_z_m=0.277, gripper_closed=False)
+    result = evaluator.result()
+    assert result["success"] is True
+    assert result["release_after_hold_seen"] is True
+    assert math.isclose(result["hold_duration_s"], 1.0)
+
+
+def test_cube_lift_evaluator_rejects_motion_without_a_valid_hold() -> None:
+    evaluator = CubeLiftEvaluator(fps=10, initial_object_z_m=0.277)
+
+    for _ in range(20):
+        evaluator.update(object_z_m=0.357, gripper_closed=False)
+    assert evaluator.result()["success"] is False
+
+    evaluator.reset()
+    for _ in range(9):
+        evaluator.update(object_z_m=0.367, gripper_closed=True)
+    evaluator.update(object_z_m=0.277, gripper_closed=False)
+    assert evaluator.result()["success"] is False
 
 
 def test_scene_camera_targets_follow_surface_without_mutating_profile() -> None:

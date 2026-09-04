@@ -33,10 +33,12 @@ STREAM_CAMERA_TARGET = (0.45, 0.0, 0.65)
 STREAM_WIDTH = 960
 STREAM_HEIGHT = 720
 STREAM_SCENE_PRIMS = ("/World/Franka", "/World/defaultGroundPlane", "/World/Light")
-ISAAC_SCENE_IDS = ("franka_empty", "rigid_pick_place")
+ISAAC_SCENE_IDS = ("franka_empty", "rigid_pick_place", "rigid_cube_lift")
 DEFAULT_WORK_SURFACE_HEIGHT_M = 0.25
 MIN_WORK_SURFACE_HEIGHT_M = 0.18
 MAX_WORK_SURFACE_HEIGHT_M = 0.32
+CUBE_LIFT_THRESHOLD_M = 0.08
+CUBE_HOLD_SECONDS = 1.0
 DEFAULT_CAMERA_PROFILE: dict[str, Any] = {
     "format": "robot_data_camera_profile",
     "format_version": 1,
@@ -333,6 +335,88 @@ def _rigid_pick_place_geometry(work_surface_height_m: float) -> dict[str, object
         "target_size_m": (0.14, 0.14, 0.004),
         "task_instruction": "Pick up the green cube and place it on the blue target",
     }
+
+
+def _rigid_cube_lift_geometry(work_surface_height_m: float) -> dict[str, object]:
+    """Return the fixed P0 cube-lift scene without a placement target."""
+    geometry = _rigid_pick_place_geometry(work_surface_height_m)
+    geometry.pop("target_center_m")
+    geometry.pop("target_size_m")
+    geometry["task_instruction"] = (
+        "Grasp the green cube, lift it at least 8 cm, hold for 1 second, then release"
+    )
+    geometry["evaluator"] = {
+        "id": "isaac_cube_lift_v1",
+        "lift_threshold_m": CUBE_LIFT_THRESHOLD_M,
+        "hold_seconds": CUBE_HOLD_SECONDS,
+    }
+    return geometry
+
+
+@dataclass
+class CubeLiftEvaluator:
+    """Dataset-rate evaluator for the fixed grasp-lift-hold-release pilot."""
+
+    fps: int
+    initial_object_z_m: float
+    lift_threshold_m: float = CUBE_LIFT_THRESHOLD_M
+    required_hold_seconds: float = CUBE_HOLD_SECONDS
+    close_seen: bool = False
+    release_after_hold_seen: bool = False
+    max_lift_m: float = 0.0
+    current_hold_frames: int = 0
+    max_hold_frames: int = 0
+
+    def __post_init__(self) -> None:
+        if self.fps <= 0:
+            raise ValueError("cube evaluator fps must be positive")
+        if self.lift_threshold_m <= 0 or self.required_hold_seconds <= 0:
+            raise ValueError("cube evaluator thresholds must be positive")
+
+    @property
+    def required_hold_frames(self) -> int:
+        return int(math.ceil(self.required_hold_seconds * self.fps))
+
+    def reset(self) -> None:
+        self.close_seen = False
+        self.release_after_hold_seen = False
+        self.max_lift_m = 0.0
+        self.current_hold_frames = 0
+        self.max_hold_frames = 0
+
+    def update(self, *, object_z_m: float, gripper_closed: bool) -> None:
+        lift_m = max(0.0, float(object_z_m) - self.initial_object_z_m)
+        self.max_lift_m = max(self.max_lift_m, lift_m)
+        if gripper_closed:
+            self.close_seen = True
+            self.current_hold_frames = (
+                self.current_hold_frames + 1
+                if lift_m >= self.lift_threshold_m
+                else 0
+            )
+            self.max_hold_frames = max(self.max_hold_frames, self.current_hold_frames)
+        else:
+            if self.close_seen and self.max_hold_frames >= self.required_hold_frames:
+                self.release_after_hold_seen = True
+            self.current_hold_frames = 0
+
+    def result(self) -> dict[str, object]:
+        success = (
+            self.close_seen
+            and self.max_lift_m >= self.lift_threshold_m
+            and self.max_hold_frames >= self.required_hold_frames
+            and self.release_after_hold_seen
+        )
+        return {
+            "success": success,
+            "close_seen": self.close_seen,
+            "release_after_hold_seen": self.release_after_hold_seen,
+            "lift_threshold_m": self.lift_threshold_m,
+            "max_lift_m": self.max_lift_m,
+            "required_hold_frames": self.required_hold_frames,
+            "max_hold_frames": self.max_hold_frames,
+            "hold_duration_s": self.max_hold_frames / self.fps,
+        }
 
 
 def _scene_camera_overrides(
@@ -1293,11 +1377,12 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
     light_cfg = sim_utils.DomeLightCfg(intensity=2500.0)
     light_cfg.func("/World/Light", light_cfg)
 
-    scene_geometry = (
-        _rigid_pick_place_geometry(args.work_surface_height_m)
-        if args.scene == "rigid_pick_place"
-        else None
-    )
+    if args.scene == "rigid_pick_place":
+        scene_geometry = _rigid_pick_place_geometry(args.work_surface_height_m)
+    elif args.scene == "rigid_cube_lift":
+        scene_geometry = _rigid_cube_lift_geometry(args.work_surface_height_m)
+    else:
+        scene_geometry = None
     work_surface_top_m = (
         float(scene_geometry["work_surface_top_m"])
         if scene_geometry is not None
@@ -1320,15 +1405,16 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
             work_surface_cfg,
             translation=scene_geometry["work_surface_center_m"],
         )
-        target_cfg = sim_utils.CuboidCfg(
-            size=scene_geometry["target_size_m"],
-            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.20, 0.48, 0.92)),
-        )
-        target_cfg.func(
-            "/World/TargetZone",
-            target_cfg,
-            translation=scene_geometry["target_center_m"],
-        )
+        if "target_size_m" in scene_geometry:
+            target_cfg = sim_utils.CuboidCfg(
+                size=scene_geometry["target_size_m"],
+                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.20, 0.48, 0.92)),
+            )
+            target_cfg.func(
+                "/World/TargetZone",
+                target_cfg,
+                translation=scene_geometry["target_center_m"],
+            )
         object_cfg = RigidObjectCfg(
             prim_path="/World/TaskObject",
             spawn=sim_utils.CuboidCfg(
@@ -1527,6 +1613,14 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
         views.activate("free", str(scene_status["viewport_camera"]))
     previews = CameraPreviewStore(target_fps=args.preview_fps)
     writer = None
+    cube_lift_evaluator = (
+        CubeLiftEvaluator(
+            fps=int(round(args.dataset_fps)),
+            initial_object_z_m=float(scene_geometry["object_start_m"][2]),
+        )
+        if args.scene == "rigid_cube_lift" and scene_geometry is not None
+        else None
+    )
     if args.smoke_steps == 0:
         from robot_data_contracts import FrankaEpisodeWriter
 
@@ -1677,6 +1771,8 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                                 controller.reset_targets(initial_joint_positions)
                                 keyboard.reset()
                                 diff_ik_controller.reset()
+                                if cube_lift_evaluator is not None:
+                                    cube_lift_evaluator.reset()
                                 episode_index = writer.start(task)
                                 recording.update(
                                     recording=True,
@@ -1687,9 +1783,28 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                                     last_event=f"Episode {episode_index} started",
                                 )
                             elif recording_command in {"success", "failure"}:
+                                evaluation = (
+                                    cube_lift_evaluator.result()
+                                    if cube_lift_evaluator is not None
+                                    else None
+                                )
                                 path = writer.finish(
                                     operator_success=recording_command == "success",
-                                    episode_metrics={"automatic_outcome": "unavailable"},
+                                    episode_metrics=(
+                                        {key: value for key, value in evaluation.items() if key != "success"}
+                                        if evaluation is not None
+                                        else {"automatic_outcome": "unavailable"}
+                                    ),
+                                    auto_success=(
+                                        bool(evaluation["success"])
+                                        if evaluation is not None
+                                        else None
+                                    ),
+                                    evaluator_id=(
+                                        "isaac_cube_lift_v1"
+                                        if evaluation is not None
+                                        else "task_evaluator"
+                                    ),
                                 )
                                 recording.update(
                                     recording=False,
@@ -1843,6 +1958,21 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                         ),
                         dtype=np.float32,
                     )
+                    ee_pose = None
+                    object_pose = None
+                    object_velocity = None
+                    if cube_lift_evaluator is not None and task_object is not None:
+                        ee_pose = (
+                            robot.data.body_pose_w.torch[0, hand_body_index]
+                            .detach().cpu().numpy()
+                        )
+                        object_pose = task_object.data.root_pose_w.torch[0].detach().cpu().numpy()
+                        object_velocity = task_object.data.root_vel_w.torch[0].detach().cpu().numpy()
+                        cube_lift_evaluator.update(
+                            object_z_m=float(object_pose[2]),
+                            gripper_closed=safe_command.gripper_closed,
+                        )
+                        telemetry.update(task_evaluator=cube_lift_evaluator.result())
                     backend.set_command(
                         safe_command.joint_targets,
                         gripper_closed=safe_command.gripper_closed,
@@ -1868,6 +1998,9 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                             else -1
                         ),
                         capture_timestamp_ns=capture_timestamp_ns,
+                        ee_pose=ee_pose,
+                        object_pose=object_pose,
+                        object_velocity=object_velocity,
                     )
                     recording.update(frames=writer.frame_count)
                 if not dataset_due:

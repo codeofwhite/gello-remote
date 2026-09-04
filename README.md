@@ -169,7 +169,14 @@ may override these values when both divide `--control_hz` exactly.
 `rigid_pick_place` scene adds a resettable 5 cm cube, target marker, and a work
 surface whose top is `0.25 m` above the Franka base by default. Tune it within
 `0.18--0.32 m` using `--work-surface-height-m`. Automatic task success is not
-yet evaluated in Isaac Sim, so only the operator outcome is written.
+available for this placement task, so only the operator outcome is written.
+
+For the first Isaac-to-OpenPI pilot, select `--scene rigid_cube_lift`. This scene
+keeps the same fixed table and green 5 cm cube but removes the placement target.
+Each demonstration must close the gripper, lift the cube at least 8 cm, hold it
+above that threshold for one second, and then release. The worker records end-
+effector pose, object pose, and object velocity, and stores an independent
+`isaac_cube_lift_v1` evaluator result alongside the operator outcome.
 
 Pass `--camera-profile-file /absolute/path/to/profile.json` to select the same
 sensor profile used by RoboData Studio. The lab profile models the active main
