@@ -35,6 +35,7 @@ from gello_remote.isaaclab_gello import (
     _camera_profile_metadata,
     _rigid_pick_place_geometry,
     _rigid_cube_lift_geometry,
+    _rollout_stage_summary,
     _scene_camera_overrides,
     _load_camera_profile,
     _missing_scene_prims,
@@ -207,6 +208,8 @@ def test_cube_lift_evaluator_requires_close_lift_hold_and_release() -> None:
     evaluator.update(object_z_m=0.277, gripper_closed=False)
     evaluator.update(object_z_m=0.367, gripper_closed=True)
     assert evaluator.result()["success"] is False
+    assert evaluator.result()["grasp"] is True
+    assert evaluator.result()["lift"] is True
 
     for _ in range(9):
         evaluator.update(object_z_m=0.367, gripper_closed=True)
@@ -216,6 +219,8 @@ def test_cube_lift_evaluator_requires_close_lift_hold_and_release() -> None:
     evaluator.update(object_z_m=0.277, gripper_closed=False)
     result = evaluator.result()
     assert result["success"] is True
+    assert result["hold"] is True
+    assert result["release"] is True
     assert result["release_after_hold_seen"] is True
     assert math.isclose(result["hold_duration_s"], 1.0)
 
@@ -232,6 +237,36 @@ def test_cube_lift_evaluator_rejects_motion_without_a_valid_hold() -> None:
         evaluator.update(object_z_m=0.367, gripper_closed=True)
     evaluator.update(object_z_m=0.277, gripper_closed=False)
     assert evaluator.result()["success"] is False
+
+
+def test_cube_lift_evaluator_does_not_call_close_alone_a_grasp() -> None:
+    evaluator = CubeLiftEvaluator(fps=10, initial_object_z_m=0.277)
+
+    for _ in range(20):
+        evaluator.update(object_z_m=0.277, gripper_closed=True)
+
+    result = evaluator.result()
+    assert result["close_seen"] is True
+    assert result["grasp"] is False
+    assert result["lift"] is False
+
+
+def test_rollout_stage_summary_keeps_each_denominator_equal() -> None:
+    reports = [
+        {
+            "success": False,
+            "metrics": {"grasp": True, "lift": True, "hold": False, "release": False},
+        },
+        {
+            "success": True,
+            "metrics": {"grasp": True, "lift": True, "hold": True, "release": True},
+        },
+    ]
+
+    summary = _rollout_stage_summary(reports)
+    assert summary["overall_success_rate"] == 0.5
+    assert summary["stages"]["grasp"]["rate"] == 1.0
+    assert summary["stages"]["hold"]["rate"] == 0.5
 
 
 def test_scene_camera_targets_follow_surface_without_mutating_profile() -> None:

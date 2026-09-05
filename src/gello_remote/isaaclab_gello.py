@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 from collections import deque
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
@@ -38,6 +39,7 @@ DEFAULT_WORK_SURFACE_HEIGHT_M = 0.25
 MIN_WORK_SURFACE_HEIGHT_M = 0.18
 MAX_WORK_SURFACE_HEIGHT_M = 0.32
 CUBE_LIFT_THRESHOLD_M = 0.08
+CUBE_GRASP_THRESHOLD_M = 0.02
 CUBE_HOLD_SECONDS = 1.0
 DEFAULT_CAMERA_PROFILE: dict[str, Any] = {
     "format": "robot_data_camera_profile",
@@ -104,7 +106,7 @@ PREVIEW_WIDTH = 320
 PREVIEW_HEIGHT = 240
 PREVIEW_JPEG_QUALITY = 70
 PREVIEW_MAX_JPEG_BYTES = 256 * 1024
-CONTROL_SOURCES = ("keyboard", "gello")
+CONTROL_SOURCES = ("keyboard", "gello", "openpi")
 KEYBOARD_KEYS = (
     "KeyW", "KeyS", "KeyA", "KeyD", "KeyQ", "KeyE",
     "KeyZ", "KeyX", "KeyT", "KeyG", "KeyC", "KeyV",
@@ -361,7 +363,9 @@ class CubeLiftEvaluator:
     initial_object_z_m: float
     lift_threshold_m: float = CUBE_LIFT_THRESHOLD_M
     required_hold_seconds: float = CUBE_HOLD_SECONDS
+    grasp_threshold_m: float = CUBE_GRASP_THRESHOLD_M
     close_seen: bool = False
+    grasp_seen: bool = False
     release_after_hold_seen: bool = False
     max_lift_m: float = 0.0
     current_hold_frames: int = 0
@@ -370,7 +374,12 @@ class CubeLiftEvaluator:
     def __post_init__(self) -> None:
         if self.fps <= 0:
             raise ValueError("cube evaluator fps must be positive")
-        if self.lift_threshold_m <= 0 or self.required_hold_seconds <= 0:
+        if (
+            self.grasp_threshold_m <= 0
+            or self.grasp_threshold_m >= self.lift_threshold_m
+            or self.lift_threshold_m <= 0
+            or self.required_hold_seconds <= 0
+        ):
             raise ValueError("cube evaluator thresholds must be positive")
 
     @property
@@ -379,6 +388,7 @@ class CubeLiftEvaluator:
 
     def reset(self) -> None:
         self.close_seen = False
+        self.grasp_seen = False
         self.release_after_hold_seen = False
         self.max_lift_m = 0.0
         self.current_hold_frames = 0
@@ -389,6 +399,7 @@ class CubeLiftEvaluator:
         self.max_lift_m = max(self.max_lift_m, lift_m)
         if gripper_closed:
             self.close_seen = True
+            self.grasp_seen = self.grasp_seen or lift_m >= self.grasp_threshold_m
             self.current_hold_frames = (
                 self.current_hold_frames + 1
                 if lift_m >= self.lift_threshold_m
@@ -402,7 +413,7 @@ class CubeLiftEvaluator:
 
     def result(self) -> dict[str, object]:
         success = (
-            self.close_seen
+            self.grasp_seen
             and self.max_lift_m >= self.lift_threshold_m
             and self.max_hold_frames >= self.required_hold_frames
             and self.release_after_hold_seen
@@ -410,13 +421,42 @@ class CubeLiftEvaluator:
         return {
             "success": success,
             "close_seen": self.close_seen,
+            "grasp": self.grasp_seen,
+            "lift": self.max_lift_m >= self.lift_threshold_m,
+            "hold": self.max_hold_frames >= self.required_hold_frames,
+            "release": self.release_after_hold_seen,
             "release_after_hold_seen": self.release_after_hold_seen,
+            "grasp_threshold_m": self.grasp_threshold_m,
             "lift_threshold_m": self.lift_threshold_m,
             "max_lift_m": self.max_lift_m,
             "required_hold_frames": self.required_hold_frames,
             "max_hold_frames": self.max_hold_frames,
             "hold_duration_s": self.max_hold_frames / self.fps,
         }
+
+
+def _rollout_stage_summary(reports: list[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate ordered cube-lift stage outcomes without hiding failed trials."""
+    stages = ("grasp", "lift", "hold", "release")
+    total = len(reports)
+    return {
+        "rollouts": total,
+        "overall_successes": sum(bool(report["success"]) for report in reports),
+        "overall_success_rate": (
+            sum(bool(report["success"]) for report in reports) / total if total else None
+        ),
+        "stages": {
+            stage: {
+                "successes": sum(bool(report["metrics"][stage]) for report in reports),
+                "rate": (
+                    sum(bool(report["metrics"][stage]) for report in reports) / total
+                    if total
+                    else None
+                ),
+            }
+            for stage in stages
+        },
+    }
 
 
 def _scene_camera_overrides(
@@ -1236,8 +1276,17 @@ def _parse_args() -> tuple[argparse.Namespace, object]:
         "--control-source",
         choices=CONTROL_SOURCES,
         default="gello",
-        help="lock the Collector to browser keyboard or GELLO input",
+        help="lock the Collector to browser keyboard, GELLO, or OpenPI input",
     )
+    parser.add_argument("--policy-host", default="127.0.0.1")
+    parser.add_argument("--policy-port", type=int, default=8000)
+    parser.add_argument("--policy-config", default="pi05_franka_joint8_lora")
+    parser.add_argument("--policy-checkpoint", type=Path)
+    parser.add_argument("--inference-steps", type=int, default=2)
+    parser.add_argument("--replan-steps", type=int, default=10)
+    parser.add_argument("--rollout-count", type=int, default=20)
+    parser.add_argument("--max-episode-frames", type=int, default=400)
+    parser.add_argument("--success-settle-frames", type=int, default=10)
     parser.add_argument("--host", default="127.0.0.1", help="HTTP/WebSocket bind host")
     parser.add_argument("--port", type=int, default=18081, help="HTTP/WebSocket bind port")
     parser.add_argument(
@@ -1317,7 +1366,10 @@ def _parse_args() -> tuple[argparse.Namespace, object]:
         _configure_gpu_selection(args, sys.argv[1:])
     except ValueError as exc:
         parser.error(str(exc))
-    if any(not 0 < port < 65536 for port in (args.port, args.signaling_port, args.media_port)):
+    if any(
+        not 0 < port < 65536
+        for port in (args.port, args.signaling_port, args.media_port, args.policy_port)
+    ):
         parser.error("HTTP, signaling, and media ports must be in [1, 65535]")
     if min(
         args.physics_hz,
@@ -1331,6 +1383,22 @@ def _parse_args() -> tuple[argparse.Namespace, object]:
         parser.error("physics, control, speed, and timeout values must be positive")
     if args.smoke_steps < 0:
         parser.error("smoke_steps must be non-negative")
+    if min(
+        args.inference_steps,
+        args.replan_steps,
+        args.rollout_count,
+        args.max_episode_frames,
+        args.success_settle_frames,
+    ) <= 0:
+        parser.error("policy rollout values must be positive")
+    if args.control_source == "openpi":
+        if args.scene != "rigid_cube_lift":
+            parser.error("OpenPI rollout currently requires --scene rigid_cube_lift")
+        if args.policy_checkpoint is None:
+            parser.error("OpenPI rollout requires --policy-checkpoint")
+        if args.smoke_steps:
+            parser.error("OpenPI rollout does not use --smoke_steps")
+        args.policy_checkpoint = args.policy_checkpoint.expanduser().resolve()
     try:
         args.work_surface_height_m = _validate_work_surface_height(
             args.work_surface_height_m
@@ -1649,13 +1717,24 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
         control_source = (
             "browser_se3_keyboard"
             if args.control_source == "keyboard"
-            else "gello_joint_targets"
+            else (
+                "openpi_policy"
+                if args.control_source == "openpi"
+                else "gello_joint_targets"
+            )
         )
         operator_command_names = (
             ["dx_m", "dy_m", "dz_m", "droll_rad", "dpitch_rad", "dyaw_rad", "gripper_closed"]
             if args.control_source == "keyboard"
-            else [f"requested_joint_position/panda_joint{index}_rad" for index in range(1, 8)]
-            + ["requested_gripper_closed"]
+            else (
+                [
+                    *(f"model_target_joint/panda_joint{index}_rad" for index in range(1, 8)),
+                    "model_target_gripper_closed_fraction",
+                ]
+                if args.control_source == "openpi"
+                else [f"requested_joint_position/panda_joint{index}_rad" for index in range(1, 8)]
+                + ["requested_gripper_closed"]
+            )
         )
         writer = FrankaEpisodeWriter(
             args.data_dir,
@@ -1676,7 +1755,11 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                 "physics_hz": args.physics_hz,
                 "control_hz": args.control_hz,
                 "control_source": control_source,
-                "control_source_options": ["browser_se3_keyboard", "gello_joint_targets"],
+                "control_source_options": [
+                    "browser_se3_keyboard",
+                    "gello_joint_targets",
+                    "openpi_policy",
+                ],
                 "operator_command_layouts": {
                     "browser_se3_keyboard": operator_command_names
                     if args.control_source == "keyboard"
@@ -1710,10 +1793,298 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                 },
                 "automatic_outcome_available": cube_lift_evaluator is not None,
                 "scene_geometry": scene_geometry,
+                "policy": (
+                    {
+                        "consumer": "openpi_franka_joint8",
+                        "config": args.policy_config,
+                        "checkpoint": str(args.policy_checkpoint),
+                        "server": f"ws://{args.policy_host}:{args.policy_port}",
+                        "replan_steps": args.replan_steps,
+                        "inference_steps": args.inference_steps,
+                    }
+                    if args.control_source == "openpi"
+                    else None
+                ),
                 "git_roots": {"gello_remote": Path(__file__).resolve().parents[2]},
                 "dependency_packages": ["isaacsim", "numpy"],
             },
+            generation_method=("policy_rollout" if args.control_source == "openpi" else None),
         )
+
+    if args.control_source == "openpi":
+        from openpi_client.websocket_client_policy import WebsocketClientPolicy
+
+        from .openpi_policy import (
+            decode_policy_action,
+            encode_policy_state,
+            encode_videos,
+            validate_action_chunk,
+        )
+
+        if writer is None or cube_lift_evaluator is None or task_object is None:
+            raise RuntimeError("OpenPI rollout requires writer, cube evaluator, and task object")
+        client = WebsocketClientPolicy(args.policy_host, args.policy_port)
+        policy_metadata = client.get_server_metadata()
+        if policy_metadata.get("action_contract") != "joint7_absolute_plus_gripper_closed_fraction":
+            raise RuntimeError(f"unexpected policy action contract: {policy_metadata!r}")
+        if int(policy_metadata.get("action_horizon", -1)) < args.replan_steps:
+            raise RuntimeError(
+                f"policy horizon {policy_metadata.get('action_horizon')} is shorter than "
+                f"replan_steps {args.replan_steps}"
+            )
+        served_checkpoint = Path(str(policy_metadata.get("checkpoint", ""))).resolve()
+        if served_checkpoint != args.policy_checkpoint:
+            raise RuntimeError(
+                f"policy server checkpoint {served_checkpoint} does not match "
+                f"requested {args.policy_checkpoint}"
+            )
+
+        policy_controller = GelloCommandController(
+            initial_joint_positions,
+            backend.joint_position_limits(),
+            control_hz=args.dataset_fps,
+            max_joint_speed=args.max_joint_speed,
+            watchdog_timeout=args.gello_timeout,
+        )
+        physics_steps_per_policy = int(round(args.physics_hz / args.dataset_fps))
+        output_root = Path(args.data_dir).expanduser().resolve()
+        batch_report_path = output_root / "batch_report.json"
+        batch_csv_path = output_root / "rollouts.csv"
+        rollout_reports: list[dict[str, Any]] = []
+
+        def write_batch_report(*, completed: bool) -> None:
+            summary = _rollout_stage_summary(rollout_reports)
+            payload = {
+                "status": "completed" if completed else "running",
+                "scene": args.scene,
+                "fixed_training_distribution": True,
+                "generalization_claimed": False,
+                "requested_rollouts": args.rollout_count,
+                "completed_rollouts": len(rollout_reports),
+                "policy_config": args.policy_config,
+                "policy_checkpoint": str(args.policy_checkpoint),
+                "policy_server_metadata": policy_metadata,
+                "control_fps": args.dataset_fps,
+                "replan_steps": args.replan_steps,
+                "inference_steps": args.inference_steps,
+                "summary": summary,
+                "rollouts": rollout_reports,
+            }
+            batch_report_path.write_text(
+                json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            fieldnames = [
+                "rollout_index",
+                "episode_path",
+                "success",
+                "grasp",
+                "lift",
+                "hold",
+                "release",
+                "frames",
+                "max_lift_m",
+                "hold_duration_s",
+                "base_video",
+                "top_video",
+                "side_video",
+                "wrist_video",
+            ]
+            with batch_csv_path.open("w", newline="", encoding="utf-8") as stream:
+                table = csv.DictWriter(stream, fieldnames=fieldnames)
+                table.writeheader()
+                for report in rollout_reports:
+                    metrics = report["metrics"]
+                    videos = report["videos"]
+                    table.writerow(
+                        {
+                            "rollout_index": report["rollout_index"],
+                            "episode_path": report["episode_path"],
+                            "success": report["success"],
+                            "grasp": metrics["grasp"],
+                            "lift": metrics["lift"],
+                            "hold": metrics["hold"],
+                            "release": metrics["release"],
+                            "frames": report["frames"],
+                            "max_lift_m": metrics["max_lift_m"],
+                            "hold_duration_s": metrics["hold_duration_s"],
+                            **{f"{name}_video": videos[name] for name in CAMERA_NAMES},
+                        }
+                    )
+
+        for rollout_index in range(args.rollout_count):
+            reset_task_assets()
+            policy_controller.reset_targets(initial_joint_positions)
+            cube_lift_evaluator.reset()
+            action_plan: list[np.ndarray] = []
+            inference_samples: list[np.ndarray] = []
+            replan_id = -1
+            stable_success_frames = 0
+            episode_index = writer.start(scene_task)
+
+            for frame_index in range(args.max_episode_frames):
+                if not simulation_app.is_running():
+                    raise RuntimeError("Isaac application stopped during policy rollout")
+                for camera in record_cameras.values():
+                    camera.update(dt=sim_dt)
+                images = {
+                    name: camera.data.output["rgb"].torch[0].detach().cpu().numpy()
+                    for name, camera in record_cameras.items()
+                }
+                capture_timestamp_ns = time.monotonic_ns()
+                arm_positions = backend.current_joint_positions()
+                finger_positions = backend.current_gripper_positions()
+                arm_velocities = backend.current_joint_velocities()
+                finger_velocities = backend.current_gripper_velocities()
+                state = np.asarray(
+                    (*arm_positions, *finger_positions, *arm_velocities, *finger_velocities),
+                    dtype=np.float32,
+                )
+                if not action_plan:
+                    command_timestamp_ns = time.time_ns()
+                    inference_started = time.perf_counter()
+                    result = client.infer(
+                        {
+                            "observation/image": images["base"],
+                            "observation/wrist_image": images["wrist"],
+                            "observation/state": encode_policy_state(state),
+                            "prompt": scene_task,
+                        }
+                    )
+                    client_total_ms = (time.perf_counter() - inference_started) * 1000.0
+                    command_receive_ns = time.monotonic_ns()
+                    action_plan.extend(
+                        validate_action_chunk(result["actions"], replan_steps=args.replan_steps)
+                    )
+                    replan_id += 1
+                    server_ms = float(result.get("server_timing", {}).get("infer_ms", client_total_ms))
+                    model_ms = float(result.get("policy_timing", {}).get("infer_ms", server_ms))
+                    inference_samples.append(
+                        np.asarray([client_total_ms, server_ms, model_ms], dtype=np.float32)
+                    )
+
+                model_action = action_plan.pop(0)
+                requested_joints, gripper_closed, requested_native = decode_policy_action(model_action)
+                global_sequence = rollout_index * args.max_episode_frames + frame_index
+                accepted = policy_controller.submit(
+                    GelloCommand(
+                        session_id="openpi-policy",
+                        sequence=global_sequence,
+                        timestamp_ns=command_timestamp_ns,
+                        joint_targets=tuple(float(value) for value in requested_joints),
+                        gripper_closed=gripper_closed,
+                    )
+                )
+                if not accepted:
+                    raise RuntimeError(f"policy command sequence {global_sequence} was rejected")
+                safe_command = policy_controller.tick()
+                finger_target = FRANKA_GRIPPER_CLOSED_M if safe_command.gripper_closed else 0.04
+                safe_native = np.asarray(
+                    (*safe_command.joint_targets, finger_target, finger_target), dtype=np.float32
+                )
+                ee_pose = robot.data.body_pose_w.torch[0, hand_body_index].detach().cpu().numpy()
+                object_pose = task_object.data.root_pose_w.torch[0].detach().cpu().numpy()
+                object_velocity = task_object.data.root_vel_w.torch[0].detach().cpu().numpy()
+                latest_timing = inference_samples[-1]
+                writer.add_frame(
+                    images=images,
+                    state=state,
+                    action=safe_native,
+                    requested_action=requested_native,
+                    safe_action=safe_native,
+                    applied_action=safe_native,
+                    operator_command=model_action,
+                    sim_time=frame_index / args.dataset_fps,
+                    control_sequence=global_sequence,
+                    control_timestamp_ns=command_timestamp_ns,
+                    control_receive_timestamp_ns=command_receive_ns,
+                    capture_timestamp_ns=capture_timestamp_ns,
+                    ee_pose=ee_pose,
+                    object_pose=object_pose,
+                    object_velocity=object_velocity,
+                    extra_arrays={
+                        "model_action_raw": model_action,
+                        "policy_replan_id": np.asarray([replan_id], dtype=np.int64),
+                        "policy_inference_timing_ms": latest_timing,
+                    },
+                )
+                backend.set_command(
+                    safe_command.joint_targets,
+                    gripper_closed=safe_command.gripper_closed,
+                )
+                for _ in range(physics_steps_per_policy):
+                    sim.step()
+                    robot.update(sim_dt)
+                    task_object.update(sim_dt)
+                    _pump_kit_frame(simulation_app)
+
+                post_object_z = float(task_object.data.root_pos_w.torch[0, 2].item())
+                cube_lift_evaluator.update(
+                    object_z_m=post_object_z,
+                    gripper_closed=safe_command.gripper_closed,
+                )
+                evaluation = cube_lift_evaluator.result()
+                stable_success_frames = (
+                    stable_success_frames + 1 if evaluation["success"] else 0
+                )
+                if stable_success_frames >= args.success_settle_frames:
+                    break
+
+            metrics = cube_lift_evaluator.result()
+            metrics["stable_success_frames"] = stable_success_frames
+            metrics["required_stable_success_frames"] = args.success_settle_frames
+            metrics["rollout_index"] = rollout_index
+            frame_count = writer.frame_count
+            episode_path = writer.finish(
+                operator_success=None,
+                auto_success=bool(metrics["success"]),
+                episode_metrics={key: value for key, value in metrics.items() if key != "success"},
+                evaluator_id="isaac_cube_lift_openpi_v1",
+                evaluator_version="1",
+            )
+            videos = encode_videos(episode_path, list(CAMERA_NAMES), int(round(args.dataset_fps)))
+            timing = np.stack(inference_samples) if inference_samples else np.empty((0, 3))
+            report = {
+                "rollout_index": rollout_index,
+                "episode_index": episode_index,
+                "episode_path": str(episode_path),
+                "success": bool(metrics["success"]),
+                "frames": frame_count,
+                "videos": videos,
+                "metrics": metrics,
+                "inference_timing_ms": (
+                    {
+                        "calls": len(timing),
+                        "client_total_mean": float(timing[:, 0].mean()),
+                        "client_total_max": float(timing[:, 0].max()),
+                        "server_mean": float(timing[:, 1].mean()),
+                        "model_mean": float(timing[:, 2].mean()),
+                    }
+                    if len(timing)
+                    else {"calls": 0}
+                ),
+            }
+            (episode_path / "rollout_report.json").write_text(
+                json.dumps(report, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            rollout_reports.append(report)
+            write_batch_report(completed=False)
+            print(
+                "ISAAC_OPENPI_ROLLOUT " + json.dumps(report, sort_keys=True),
+                file=sys.__stderr__,
+                flush=True,
+            )
+
+        write_batch_report(completed=True)
+        final_summary = _rollout_stage_summary(rollout_reports)
+        print(
+            "ISAAC_OPENPI_BATCH " + json.dumps(final_summary, sort_keys=True),
+            file=sys.__stderr__,
+            flush=True,
+        )
+        return True
+
     web_server = GelloWebServer(
         controller,
         telemetry,

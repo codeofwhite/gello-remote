@@ -77,6 +77,24 @@ targets directly to `panda_joint1` through `panda_joint7`; it does not use IK.
 The eighth GELLO motor selects the open (`0.04 m`) or closed (`0.00 m`) Panda
 finger target.
 
+The same entry point also supports a bounded, non-interactive OpenPI evaluation
+mode. `--control-source openpi` connects to the websocket policy server, runs
+all requested episodes in one Isaac process, and writes canonical episodes,
+four MP4 files per rollout, `rollouts.csv`, and `batch_report.json` under the
+selected data directory. The fixed `rigid_cube_lift` evaluator reports grasp,
+lift, hold, and release separately; grasp requires the closed gripper to move
+the cube at least 2 cm above its initial height.
+
+```bash
+env CONDA_PREFIX=/home/zhanghejun/miniconda3/envs/isaaclab \
+  PYTHONPATH=/data/zhanghejun/gello-remote/src:/data/zhanghejun/openpi/packages/openpi-client/src:/data/zhanghejun/robot-data-studio/packages/robot-data-contracts/src \
+  /data/zhanghejun/IsaacLab/isaaclab.sh -p -m gello_remote.isaaclab_gello \
+  --control-source openpi --scene rigid_cube_lift --gpu-id 6 \
+  --enable_cameras --rollout-count 20 --max-episode-frames 400 \
+  --policy-checkpoint /absolute/path/to/checkpoint \
+  --data-dir /absolute/path/to/rollouts
+```
+
 The simulated arm uses Isaac Lab's `FRANKA_PANDA_HIGH_PD_CFG`: shoulder and
 forearm joint stiffness are `400`, damping is `80`, and articulation gravity is
 disabled to represent a gravity-compensated position servo. This changes only
