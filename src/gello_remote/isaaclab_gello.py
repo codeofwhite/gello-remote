@@ -1287,6 +1287,20 @@ def _parse_args() -> tuple[argparse.Namespace, object]:
     parser.add_argument("--rollout-count", type=int, default=20)
     parser.add_argument("--max-episode-frames", type=int, default=400)
     parser.add_argument("--success-settle-frames", type=int, default=10)
+    parser.add_argument(
+        "--gripper-filter",
+        choices=("single_threshold", "hysteresis"),
+        default="single_threshold",
+        help="convert OpenPI closed fractions with the legacy threshold or hysteresis",
+    )
+    parser.add_argument("--gripper-close-threshold", type=float, default=0.5)
+    parser.add_argument("--gripper-open-threshold", type=float, default=0.5)
+    parser.add_argument("--gripper-min-closed-seconds", type=float, default=0.0)
+    parser.add_argument(
+        "--full-horizon",
+        action="store_true",
+        help="record every requested frame even after task success for paired evaluations",
+    )
     parser.add_argument("--host", default="127.0.0.1", help="HTTP/WebSocket bind host")
     parser.add_argument("--port", type=int, default=18081, help="HTTP/WebSocket bind port")
     parser.add_argument(
@@ -1391,6 +1405,18 @@ def _parse_args() -> tuple[argparse.Namespace, object]:
         args.success_settle_frames,
     ) <= 0:
         parser.error("policy rollout values must be positive")
+    if not all(
+        math.isfinite(value) and 0.0 <= value <= 1.0
+        for value in (args.gripper_close_threshold, args.gripper_open_threshold)
+    ):
+        parser.error("gripper thresholds must be finite values in [0, 1]")
+    if not math.isfinite(args.gripper_min_closed_seconds) or args.gripper_min_closed_seconds < 0:
+        parser.error("gripper minimum closed seconds must be finite and non-negative")
+    if (
+        args.gripper_filter == "hysteresis"
+        and args.gripper_close_threshold <= args.gripper_open_threshold
+    ):
+        parser.error("hysteresis close threshold must exceed open threshold")
     if args.control_source == "openpi":
         if args.scene != "rigid_cube_lift":
             parser.error("OpenPI rollout currently requires --scene rigid_cube_lift")
@@ -1417,6 +1443,9 @@ def _parse_args() -> tuple[argparse.Namespace, object]:
         args.dataset_fps = float(args.camera_profile.get("dataset_fps_default", 10.0))
     if not math.isclose(args.dataset_fps, round(args.dataset_fps), rel_tol=0.0, abs_tol=1e-9):
         parser.error("dataset-fps must be an integer because EpisodeWriter stores an integer fps")
+    args.gripper_min_closed_frames = int(
+        math.ceil(args.gripper_min_closed_seconds * args.dataset_fps)
+    )
     decimation = args.physics_hz / args.control_hz
     if not math.isclose(decimation, round(decimation), rel_tol=0.0, abs_tol=1e-9):
         parser.error("physics_hz must be an integer multiple of control_hz")
@@ -1801,6 +1830,14 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                         "server": f"ws://{args.policy_host}:{args.policy_port}",
                         "replan_steps": args.replan_steps,
                         "inference_steps": args.inference_steps,
+                        "gripper_filter": {
+                            "mode": args.gripper_filter,
+                            "close_threshold": args.gripper_close_threshold,
+                            "open_threshold": args.gripper_open_threshold,
+                            "min_closed_seconds": args.gripper_min_closed_seconds,
+                            "min_closed_frames": args.gripper_min_closed_frames,
+                        },
+                        "full_horizon": args.full_horizon,
                     }
                     if args.control_source == "openpi"
                     else None
@@ -1815,6 +1852,7 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
         from openpi_client.websocket_client_policy import WebsocketClientPolicy
 
         from .openpi_policy import (
+            GripperCommandFilter,
             decode_policy_action,
             encode_policy_state,
             encode_videos,
@@ -1847,6 +1885,16 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
             watchdog_timeout=args.gello_timeout,
         )
         physics_steps_per_policy = int(round(args.physics_hz / args.dataset_fps))
+        gripper_filter = GripperCommandFilter(
+            mode=args.gripper_filter,
+            close_threshold=args.gripper_close_threshold,
+            open_threshold=args.gripper_open_threshold,
+            min_closed_frames=args.gripper_min_closed_frames,
+        )
+        gripper_filter_config = {
+            **gripper_filter.configuration(),
+            "min_closed_seconds": args.gripper_min_closed_seconds,
+        }
         output_root = Path(args.data_dir).expanduser().resolve()
         batch_report_path = output_root / "batch_report.json"
         batch_csv_path = output_root / "rollouts.csv"
@@ -1867,6 +1915,8 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                 "control_fps": args.dataset_fps,
                 "replan_steps": args.replan_steps,
                 "inference_steps": args.inference_steps,
+                "gripper_filter": gripper_filter_config,
+                "full_horizon": args.full_horizon,
                 "summary": summary,
                 "rollouts": rollout_reports,
             }
@@ -1885,6 +1935,8 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                 "frames",
                 "max_lift_m",
                 "hold_duration_s",
+                "raw_gripper_switches",
+                "applied_gripper_switches",
                 "base_video",
                 "top_video",
                 "side_video",
@@ -1908,6 +1960,8 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                             "frames": report["frames"],
                             "max_lift_m": metrics["max_lift_m"],
                             "hold_duration_s": metrics["hold_duration_s"],
+                            "raw_gripper_switches": report["gripper_diagnostics"]["raw_switches"],
+                            "applied_gripper_switches": report["gripper_diagnostics"]["applied_switches"],
                             **{f"{name}_video": videos[name] for name in CAMERA_NAMES},
                         }
                     )
@@ -1916,8 +1970,11 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
             reset_task_assets()
             policy_controller.reset_targets(initial_joint_positions)
             cube_lift_evaluator.reset()
+            gripper_filter.reset()
             action_plan: list[np.ndarray] = []
             inference_samples: list[np.ndarray] = []
+            raw_gripper_commands: list[bool] = []
+            applied_gripper_commands: list[bool] = []
             replan_id = -1
             stable_success_frames = 0
             episode_index = writer.start(scene_task)
@@ -1964,7 +2021,11 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                     )
 
                 model_action = action_plan.pop(0)
-                requested_joints, gripper_closed, requested_native = decode_policy_action(model_action)
+                requested_joints, _, requested_native = decode_policy_action(model_action)
+                raw_gripper_closed = float(model_action[7]) >= 0.5
+                gripper_closed = gripper_filter.update(float(model_action[7]))
+                raw_gripper_commands.append(raw_gripper_closed)
+                applied_gripper_commands.append(gripper_closed)
                 global_sequence = rollout_index * args.max_episode_frames + frame_index
                 accepted = policy_controller.submit(
                     GelloCommand(
@@ -2006,6 +2067,12 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                         "model_action_raw": model_action,
                         "policy_replan_id": np.asarray([replan_id], dtype=np.int64),
                         "policy_inference_timing_ms": latest_timing,
+                        "policy_gripper_raw_closed": np.asarray(
+                            [raw_gripper_closed], dtype=np.bool_
+                        ),
+                        "policy_gripper_filtered_closed": np.asarray(
+                            [gripper_closed], dtype=np.bool_
+                        ),
                     },
                 )
                 backend.set_command(
@@ -2027,7 +2094,7 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                 stable_success_frames = (
                     stable_success_frames + 1 if evaluation["success"] else 0
                 )
-                if stable_success_frames >= args.success_settle_frames:
+                if stable_success_frames >= args.success_settle_frames and not args.full_horizon:
                     break
 
             metrics = cube_lift_evaluator.result()
@@ -2044,6 +2111,16 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
             )
             videos = encode_videos(episode_path, list(CAMERA_NAMES), int(round(args.dataset_fps)))
             timing = np.stack(inference_samples) if inference_samples else np.empty((0, 3))
+            raw_switches = sum(
+                current != previous
+                for previous, current in zip(raw_gripper_commands, raw_gripper_commands[1:])
+            )
+            applied_switches = sum(
+                current != previous
+                for previous, current in zip(
+                    applied_gripper_commands, applied_gripper_commands[1:]
+                )
+            )
             report = {
                 "rollout_index": rollout_index,
                 "episode_index": episode_index,
@@ -2052,6 +2129,21 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                 "frames": frame_count,
                 "videos": videos,
                 "metrics": metrics,
+                "gripper_filter": gripper_filter_config,
+                "gripper_diagnostics": {
+                    "raw_switches": raw_switches,
+                    "applied_switches": applied_switches,
+                    "raw_closed_fraction": float(np.mean(raw_gripper_commands)),
+                    "applied_closed_fraction": float(np.mean(applied_gripper_commands)),
+                    "first_raw_close_frame": next(
+                        (index for index, value in enumerate(raw_gripper_commands) if value),
+                        None,
+                    ),
+                    "first_applied_close_frame": next(
+                        (index for index, value in enumerate(applied_gripper_commands) if value),
+                        None,
+                    ),
+                },
                 "inference_timing_ms": (
                     {
                         "calls": len(timing),

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+import math
 from pathlib import Path
 import shutil
 import subprocess
@@ -11,6 +13,73 @@ import numpy as np
 
 
 MAX_GRIPPER_WIDTH_M = 0.08
+
+
+@dataclass
+class GripperCommandFilter:
+    """Convert a continuous closed fraction to a stable binary command."""
+
+    mode: str = "single_threshold"
+    close_threshold: float = 0.5
+    open_threshold: float = 0.5
+    min_closed_frames: int = 0
+    _closed: bool = field(init=False, default=False)
+    _closed_frames: int = field(init=False, default=0)
+
+    def __post_init__(self) -> None:
+        if self.mode not in {"single_threshold", "hysteresis"}:
+            raise ValueError(f"unknown gripper filter mode: {self.mode}")
+        if not all(
+            math.isfinite(value) and 0.0 <= value <= 1.0
+            for value in (self.close_threshold, self.open_threshold)
+        ):
+            raise ValueError("gripper thresholds must be finite values in [0, 1]")
+        if self.mode == "hysteresis" and self.close_threshold <= self.open_threshold:
+            raise ValueError("hysteresis close threshold must exceed open threshold")
+        if self.min_closed_frames < 0:
+            raise ValueError("minimum closed frames must be non-negative")
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    def reset(self, *, initially_closed: bool = False) -> None:
+        self._closed = bool(initially_closed)
+        self._closed_frames = 1 if self._closed else 0
+
+    def update(self, closed_fraction: float) -> bool:
+        value = float(closed_fraction)
+        if not math.isfinite(value):
+            raise ValueError("gripper closed fraction must be finite")
+        value = float(np.clip(value, 0.0, 1.0))
+        if self.mode == "single_threshold":
+            self._closed = value >= self.close_threshold
+            self._closed_frames = self._closed_frames + 1 if self._closed else 0
+            return self._closed
+
+        if not self._closed:
+            if value > self.close_threshold:
+                self._closed = True
+                self._closed_frames = 1
+            return self._closed
+
+        if self._closed_frames < self.min_closed_frames:
+            self._closed_frames += 1
+            return True
+        if value < self.open_threshold:
+            self._closed = False
+            self._closed_frames = 0
+            return False
+        self._closed_frames += 1
+        return True
+
+    def configuration(self) -> dict[str, object]:
+        return {
+            "mode": self.mode,
+            "close_threshold": self.close_threshold,
+            "open_threshold": self.open_threshold,
+            "min_closed_frames": self.min_closed_frames,
+        }
 
 
 def encode_policy_state(native_state: np.ndarray) -> np.ndarray:

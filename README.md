@@ -95,6 +95,15 @@ env CONDA_PREFIX=/home/zhanghejun/miniconda3/envs/isaaclab \
   --data-dir /absolute/path/to/rollouts
 ```
 
+For a paired gripper-discretization diagnostic, keep the checkpoint, seed,
+scene, cameras, horizon, and policy RNG restart fixed. The legacy arm uses
+`--gripper-filter single_threshold --gripper-close-threshold 0.5`. The
+hysteresis arm uses `--gripper-filter hysteresis
+--gripper-close-threshold 0.65 --gripper-open-threshold 0.35
+--gripper-min-closed-seconds 0.75`. Add `--full-horizon` to both arms so every
+rollout records the same number of policy calls. Reports retain both the raw
+model threshold crossings and the filtered binary gripper commands.
+
 The simulated arm uses Isaac Lab's `FRANKA_PANDA_HIGH_PD_CFG`: shoulder and
 forearm joint stiffness are `400`, damping is `80`, and articulation gravity is
 disabled to represent a gravity-compensated position servo. This changes only
