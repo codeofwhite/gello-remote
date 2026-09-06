@@ -85,6 +85,28 @@ selected data directory. The fixed `rigid_cube_lift` evaluator reports grasp,
 lift, hold, and release separately; grasp requires the closed gripper to move
 the cube at least 2 cm above its initial height.
 
+`--control-source trajectory` is the Isaac MimicGen-lite execution path for
+resolved plans from `/data/zhanghejun/robot-data-generation`. For each source it
+runs FK on the loaded Franka using the recorded `applied_action`, retargets the
+resulting `panda_hand` poses around the cube, and follows the 20 Hz waypoints
+through continuous absolute DLS IK and the existing joint safety limiter. Before
+closing, it holds the pre-grasp pose until the resolved position/orientation
+tolerances are stable. It then records fresh camera, state, action, object,
+tracking-error, evaluator, and lineage evidence at 10 Hz. Start with the
+five-attempt nominal plan before the 100-attempt XY plan:
+
+```bash
+env CONDA_PREFIX=/home/zhanghejun/miniconda3/envs/isaaclab \
+  PYTHONPATH=/data/zhanghejun/gello-remote/src:/data/zhanghejun/robot-data-generation/src:/data/zhanghejun/robot-data-studio/packages/robot-data-contracts/src \
+  /data/zhanghejun/IsaacLab/isaaclab.sh -p -m gello_remote.isaaclab_gello \
+  --control-source trajectory --scene rigid_cube_lift --gpu-id 6 --enable_cameras \
+  --control_hz 20 --dataset-fps 10 \
+  --generation-plan /tmp/isaac_rigid_cube_lift_nominal_plan.json \
+  --data-dir /absolute/path/to/nominal_replays
+```
+
+Use `--resume-generation` only with the same plan and output directory.
+
 ```bash
 env CONDA_PREFIX=/home/zhanghejun/miniconda3/envs/isaaclab \
   PYTHONPATH=/data/zhanghejun/gello-remote/src:/data/zhanghejun/openpi/packages/openpi-client/src:/data/zhanghejun/robot-data-studio/packages/robot-data-contracts/src \
@@ -94,6 +116,13 @@ env CONDA_PREFIX=/home/zhanghejun/miniconda3/envs/isaaclab \
   --policy-checkpoint /absolute/path/to/checkpoint \
   --data-dir /absolute/path/to/rollouts
 ```
+
+For held-out evaluation, add a leakage-checked
+`--evaluation-plan /absolute/path/to/heldout_plan.json`. The worker applies each
+resolved XY offset at reset, records the condition ID/seed/offset in raw episode
+arrays and rollout reports, and refuses to overwrite an existing
+`batch_report.json`. `--evaluation-limit 1` provides a bounded runtime smoke;
+do not mix that smoke directory with the formal paired batches.
 
 For a paired gripper-discretization diagnostic, keep the checkpoint, seed,
 scene, cameras, horizon, and policy RNG restart fixed. The legacy arm uses

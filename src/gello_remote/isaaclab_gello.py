@@ -106,7 +106,7 @@ PREVIEW_WIDTH = 320
 PREVIEW_HEIGHT = 240
 PREVIEW_JPEG_QUALITY = 70
 PREVIEW_MAX_JPEG_BYTES = 256 * 1024
-CONTROL_SOURCES = ("keyboard", "gello", "openpi")
+CONTROL_SOURCES = ("keyboard", "gello", "openpi", "trajectory")
 KEYBOARD_KEYS = (
     "KeyW", "KeyS", "KeyA", "KeyD", "KeyQ", "KeyE",
     "KeyZ", "KeyX", "KeyT", "KeyG", "KeyC", "KeyV",
@@ -364,16 +364,20 @@ class CubeLiftEvaluator:
     lift_threshold_m: float = CUBE_LIFT_THRESHOLD_M
     required_hold_seconds: float = CUBE_HOLD_SECONDS
     grasp_threshold_m: float = CUBE_GRASP_THRESHOLD_M
+    success_mode: str = "lift_hold_release"
     close_seen: bool = False
     grasp_seen: bool = False
     release_after_hold_seen: bool = False
     max_lift_m: float = 0.0
+    max_closed_lift_m: float = 0.0
     current_hold_frames: int = 0
     max_hold_frames: int = 0
 
     def __post_init__(self) -> None:
         if self.fps <= 0:
             raise ValueError("cube evaluator fps must be positive")
+        if self.success_mode not in {"lift", "lift_hold_release"}:
+            raise ValueError("cube evaluator success_mode must be lift or lift_hold_release")
         if (
             self.grasp_threshold_m <= 0
             or self.grasp_threshold_m >= self.lift_threshold_m
@@ -391,6 +395,7 @@ class CubeLiftEvaluator:
         self.grasp_seen = False
         self.release_after_hold_seen = False
         self.max_lift_m = 0.0
+        self.max_closed_lift_m = 0.0
         self.current_hold_frames = 0
         self.max_hold_frames = 0
 
@@ -399,6 +404,7 @@ class CubeLiftEvaluator:
         self.max_lift_m = max(self.max_lift_m, lift_m)
         if gripper_closed:
             self.close_seen = True
+            self.max_closed_lift_m = max(self.max_closed_lift_m, lift_m)
             self.grasp_seen = self.grasp_seen or lift_m >= self.grasp_threshold_m
             self.current_hold_frames = (
                 self.current_hold_frames + 1
@@ -412,27 +418,92 @@ class CubeLiftEvaluator:
             self.current_hold_frames = 0
 
     def result(self) -> dict[str, object]:
-        success = (
-            self.grasp_seen
-            and self.max_lift_m >= self.lift_threshold_m
-            and self.max_hold_frames >= self.required_hold_frames
-            and self.release_after_hold_seen
-        )
+        lift_success = self.max_closed_lift_m >= self.lift_threshold_m
+        success = self.grasp_seen and lift_success
+        if self.success_mode == "lift_hold_release":
+            success = (
+                success
+                and self.max_hold_frames >= self.required_hold_frames
+                and self.release_after_hold_seen
+            )
         return {
             "success": success,
+            "success_mode": self.success_mode,
             "close_seen": self.close_seen,
             "grasp": self.grasp_seen,
-            "lift": self.max_lift_m >= self.lift_threshold_m,
+            "lift": lift_success,
             "hold": self.max_hold_frames >= self.required_hold_frames,
             "release": self.release_after_hold_seen,
             "release_after_hold_seen": self.release_after_hold_seen,
             "grasp_threshold_m": self.grasp_threshold_m,
             "lift_threshold_m": self.lift_threshold_m,
             "max_lift_m": self.max_lift_m,
+            "max_closed_lift_m": self.max_closed_lift_m,
             "required_hold_frames": self.required_hold_frames,
             "max_hold_frames": self.max_hold_frames,
             "hold_duration_s": self.max_hold_frames / self.fps,
         }
+
+
+def _pose_tracking_error(
+    actual_pose_wxyz: tuple[float, ...] | list[float] | Any,
+    target_pose_wxyz: tuple[float, ...] | list[float] | Any,
+) -> tuple[float, float]:
+    """Return translation norm and shortest quaternion angle for two xyz+wxyz poses."""
+
+    import numpy as np
+
+    actual = np.asarray(actual_pose_wxyz, dtype=np.float64)
+    target = np.asarray(target_pose_wxyz, dtype=np.float64)
+    if actual.shape != (7,) or target.shape != (7,) or not np.isfinite((actual, target)).all():
+        raise ValueError("pose tracking inputs must be finite xyz+wxyz vectors")
+    actual_norm = float(np.linalg.norm(actual[3:]))
+    target_norm = float(np.linalg.norm(target[3:]))
+    if actual_norm <= 1e-12 or target_norm <= 1e-12:
+        raise ValueError("pose tracking quaternions must have non-zero norm")
+    actual_q = actual[3:] / actual_norm
+    target_q = target[3:] / target_norm
+    position_error = float(np.linalg.norm(actual[:3] - target[:3]))
+    quaternion_dot = float(np.clip(abs(np.dot(actual_q, target_q)), 0.0, 1.0))
+    rotation_error = 2.0 * math.acos(quaternion_dot)
+    return position_error, rotation_error
+
+
+@dataclass
+class PoseConvergenceGate:
+    position_tolerance_m: float
+    rotation_tolerance_rad: float
+    required_stable_ticks: int
+    timeout_ticks: int
+    elapsed_ticks: int = 0
+    stable_ticks: int = 0
+
+    def __post_init__(self) -> None:
+        if (
+            self.position_tolerance_m <= 0.0
+            or self.rotation_tolerance_rad <= 0.0
+            or self.required_stable_ticks <= 0
+            or self.timeout_ticks < self.required_stable_ticks
+        ):
+            raise ValueError("invalid pose convergence gate parameters")
+
+    def update(self, actual_pose: Any, target_pose: Any) -> tuple[str, float, float]:
+        position_error, rotation_error = _pose_tracking_error(actual_pose, target_pose)
+        self.elapsed_ticks += 1
+        if (
+            position_error <= self.position_tolerance_m
+            and rotation_error <= self.rotation_tolerance_rad
+        ):
+            self.stable_ticks += 1
+        else:
+            self.stable_ticks = 0
+        if self.stable_ticks >= self.required_stable_ticks:
+            status = "converged"
+        elif self.elapsed_ticks >= self.timeout_ticks:
+            status = "timed_out"
+        else:
+            status = "waiting"
+        return status, position_error, rotation_error
 
 
 def _rollout_stage_summary(reports: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1276,7 +1347,7 @@ def _parse_args() -> tuple[argparse.Namespace, object]:
         "--control-source",
         choices=CONTROL_SOURCES,
         default="gello",
-        help="lock the Collector to browser keyboard, GELLO, or OpenPI input",
+        help="lock execution to browser keyboard, GELLO, OpenPI, or a resolved trajectory plan",
     )
     parser.add_argument("--policy-host", default="127.0.0.1")
     parser.add_argument("--policy-port", type=int, default=8000)
@@ -1287,6 +1358,26 @@ def _parse_args() -> tuple[argparse.Namespace, object]:
     parser.add_argument("--rollout-count", type=int, default=20)
     parser.add_argument("--max-episode-frames", type=int, default=400)
     parser.add_argument("--success-settle-frames", type=int, default=10)
+    parser.add_argument(
+        "--evaluation-plan",
+        type=Path,
+        help="leakage-checked held-out XY conditions for an OpenPI evaluation",
+    )
+    parser.add_argument(
+        "--evaluation-limit",
+        type=int,
+        help="run only the first N evaluation conditions (for bounded smoke tests)",
+    )
+    parser.add_argument(
+        "--generation-plan",
+        type=Path,
+        help="resolved robot-data-generation plan for trajectory execution",
+    )
+    parser.add_argument(
+        "--resume-generation",
+        action="store_true",
+        help="resume a matching generation batch report in --data-dir",
+    )
     parser.add_argument(
         "--gripper-filter",
         choices=("single_threshold", "hysteresis"),
@@ -1405,6 +1496,8 @@ def _parse_args() -> tuple[argparse.Namespace, object]:
         args.success_settle_frames,
     ) <= 0:
         parser.error("policy rollout values must be positive")
+    if args.evaluation_limit is not None and args.evaluation_limit <= 0:
+        parser.error("--evaluation-limit must be positive")
     if not all(
         math.isfinite(value) and 0.0 <= value <= 1.0
         for value in (args.gripper_close_threshold, args.gripper_open_threshold)
@@ -1425,6 +1518,20 @@ def _parse_args() -> tuple[argparse.Namespace, object]:
         if args.smoke_steps:
             parser.error("OpenPI rollout does not use --smoke_steps")
         args.policy_checkpoint = args.policy_checkpoint.expanduser().resolve()
+        if args.evaluation_plan is not None:
+            args.evaluation_plan = args.evaluation_plan.expanduser().resolve()
+    elif args.evaluation_plan is not None or args.evaluation_limit is not None:
+        parser.error("evaluation plan options require --control-source openpi")
+    if args.control_source == "trajectory":
+        if args.scene != "rigid_cube_lift":
+            parser.error("trajectory execution currently requires --scene rigid_cube_lift")
+        if args.generation_plan is None:
+            parser.error("trajectory execution requires --generation-plan")
+        if args.smoke_steps:
+            parser.error("trajectory execution does not use --smoke_steps")
+        args.generation_plan = args.generation_plan.expanduser().resolve()
+    elif args.generation_plan is not None or args.resume_generation:
+        parser.error("generation plan options require --control-source trajectory")
     try:
         args.work_surface_height_m = _validate_work_surface_height(
             args.work_surface_height_m
@@ -1606,13 +1713,19 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
             camera_prim_paths[camera_name] = prim_path
     sim.reset()
 
-    def reset_task_assets() -> None:
+    def reset_task_assets(
+        object_start_position_m: tuple[float, float, float] | None = None,
+    ) -> None:
         robot.write_joint_position_to_sim_index(position=robot.data.default_joint_pos.torch)
         robot.write_joint_velocity_to_sim_index(velocity=robot.data.default_joint_vel.torch)
         robot.reset()
         robot.update(sim_dt)
         if task_object is not None:
             root_state = task_object.data.default_root_state.torch.clone()
+            if object_start_position_m is not None:
+                root_state[:, :3] = torch.tensor(
+                    [object_start_position_m], dtype=torch.float32, device=sim.device
+                )
             task_object.write_root_pose_to_sim_index(root_pose=root_state[:, :7])
             task_object.write_root_velocity_to_sim_index(root_velocity=root_state[:, 7:])
             task_object.reset()
@@ -1697,6 +1810,79 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
             raise RuntimeError("Differential IK produced a non-finite Franka target")
         return tuple(float(value) for value in desired[0].detach().cpu().tolist())
 
+    trajectory_ik_controller = DifferentialIKController(
+        DifferentialIKControllerCfg(
+            command_type="pose", use_relative_mode=False, ik_method="dls"
+        ),
+        num_envs=1,
+        device=sim.device,
+    )
+
+    def trajectory_joint_targets(target_pose_w: np.ndarray) -> tuple[float, ...]:
+        """Convert one world-frame target pose (xyz + quaternion wxyz) through DLS IK."""
+        target = torch.as_tensor(
+            target_pose_w, dtype=torch.float32, device=sim.device
+        ).reshape(1, 7)
+        root_pose_w = robot.data.root_pose_w.torch
+        target_pos_b, target_quat_b = subtract_frame_transforms(
+            root_pose_w[:, :3], root_pose_w[:, 3:7], target[:, :3], target[:, 3:7]
+        )
+        trajectory_ik_controller.set_command(
+            torch.cat((target_pos_b, target_quat_b), dim=-1)
+        )
+        ee_pose_w = robot.data.body_pose_w.torch[:, hand_body_index]
+        ee_pos_b, ee_quat_b = subtract_frame_transforms(
+            root_pose_w[:, :3],
+            root_pose_w[:, 3:7],
+            ee_pose_w[:, :3],
+            ee_pose_w[:, 3:7],
+        )
+        jacobian = robot.data.body_link_jacobian_w.torch[
+            :, hand_jacobian_index, :, jacobian_joint_ids
+        ]
+        joint_pos = robot.data.joint_pos.torch[:, arm_joint_ids]
+        desired = trajectory_ik_controller.compute(
+            ee_pos_b, ee_quat_b, jacobian, joint_pos
+        )
+        if not bool(torch.isfinite(desired).all().item()):
+            raise RuntimeError("trajectory IK produced a non-finite Franka target")
+        return tuple(float(value) for value in desired[0].detach().cpu().tolist())
+
+    def recover_controller_target_poses(applied_action: np.ndarray) -> np.ndarray:
+        """Run FK on the loaded Isaac articulation for each applied arm target."""
+
+        actions = np.asarray(applied_action, dtype=np.float32)
+        if actions.ndim != 2 or actions.shape[1] != 8 or not np.isfinite(actions).all():
+            raise ValueError("FK recovery requires finite applied_action with shape [frames, 8]")
+        targets = torch.as_tensor(actions[:, :7], dtype=torch.float32, device=sim.device)
+        zero_velocity = torch.zeros((1, len(arm_joint_ids)), dtype=torch.float32, device=sim.device)
+        poses: list[np.ndarray] = []
+        try:
+            for target in targets:
+                robot.write_joint_position_to_sim_index(
+                    position=target.reshape(1, -1), joint_ids=arm_joint_ids
+                )
+                robot.write_joint_velocity_to_sim_index(
+                    velocity=zero_velocity, joint_ids=arm_joint_ids
+                )
+                sim.forward()
+                # Advance the asset-data timestamp so lazy body-pose buffers are
+                # invalidated after each kinematic write. Physics itself is not stepped.
+                robot.update(sim_dt)
+                pose = (
+                    robot.data.body_pose_w.torch[0, hand_body_index]
+                    .detach()
+                    .cpu()
+                    .numpy()
+                    .copy()
+                )
+                if pose.shape != (7,) or not np.isfinite(pose).all():
+                    raise RuntimeError("Isaac FK produced a non-finite panda_hand pose")
+                poses.append(pose)
+        finally:
+            reset_task_assets()
+        return np.asarray(poses, dtype=np.float32)
+
     telemetry = TelemetryStore()
     scene_task = (
         str(scene_geometry["task_instruction"])
@@ -1726,8 +1912,9 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
         if args.scene == "rigid_cube_lift" and scene_geometry is not None
         else None
     )
+    make_episode_writer = None
     if args.smoke_steps == 0:
-        from robot_data_contracts import FrankaEpisodeWriter
+        from robot_data_contracts import AugmentationLineageV1, FrankaEpisodeWriter
 
         try:
             engine_version = importlib.metadata.version("isaacsim")
@@ -1743,87 +1930,112 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
             "target_joint_position/panda_finger_joint1_m",
             "target_joint_position/panda_finger_joint2_m",
         ]
-        control_source = (
-            "browser_se3_keyboard"
-            if args.control_source == "keyboard"
-            else (
-                "openpi_policy"
-                if args.control_source == "openpi"
-                else "gello_joint_targets"
-            )
-        )
-        operator_command_names = (
-            ["dx_m", "dy_m", "dz_m", "droll_rad", "dpitch_rad", "dyaw_rad", "gripper_closed"]
-            if args.control_source == "keyboard"
-            else (
-                [
-                    *(f"model_target_joint/panda_joint{index}_rad" for index in range(1, 8)),
-                    "model_target_gripper_closed_fraction",
-                ]
-                if args.control_source == "openpi"
-                else [f"requested_joint_position/panda_joint{index}_rad" for index in range(1, 8)]
-                + ["requested_gripper_closed"]
-            )
-        )
-        writer = FrankaEpisodeWriter(
-            args.data_dir,
-            fps=int(round(args.dataset_fps)),
-            engine_id="isaac_sim",
-            engine_version=engine_version,
-            scene_id=args.scene,
-            seed=args.seed,
-            worker_id="gello_remote_isaac_sim",
-            control_source=control_source,
-            state_names=state_names,
-            action_names=action_names,
-            operator_command_names=operator_command_names,
-            camera_names=list(CAMERA_NAMES),
-            run_metadata={
-                "isaaclab_device": args.device,
-                "gpu_id": args.gpu_id,
-                "physics_hz": args.physics_hz,
-                "control_hz": args.control_hz,
-                "control_source": control_source,
-                "control_source_options": [
-                    "browser_se3_keyboard",
-                    "gello_joint_targets",
-                    "openpi_policy",
+        base_run_metadata = {
+            "isaaclab_device": args.device,
+            "gpu_id": args.gpu_id,
+            "physics_hz": args.physics_hz,
+            "control_hz": args.control_hz,
+            "control_source_options": [
+                "browser_se3_keyboard",
+                "gello_joint_targets",
+                "openpi_policy",
+                "retargeted_trajectory",
+            ],
+            "operator_command_layouts": {
+                "browser_se3_keyboard": [
+                    "dx_m", "dy_m", "dz_m", "droll_rad", "dpitch_rad", "dyaw_rad",
+                    "gripper_closed",
                 ],
-                "operator_command_layouts": {
-                    "browser_se3_keyboard": operator_command_names
-                    if args.control_source == "keyboard"
-                    else ["dx_m", "dy_m", "dz_m", "droll_rad", "dpitch_rad", "dyaw_rad", "gripper_closed"],
-                    "gello_joint_targets": [
-                        *[f"panda_joint{index}_rad" for index in range(1, 8)],
-                        "gripper_closed",
-                    ],
-                },
-                "keyboard_mapping": KEYBOARD_AXIS_COMMANDS,
-                "keyboard_position_step_m": args.keyboard_position_step_m,
-                "keyboard_rotation_step_rad": args.keyboard_rotation_step_rad,
-                "keyboard_ik": {
-                    "command_type": "pose",
-                    "use_relative_mode": True,
-                    "method": "dls",
-                },
-                "dataset_fps": args.dataset_fps,
-                "preview_fps": args.preview_fps,
-                "stream_fps": args.stream_fps,
-                "franka_usd": args.franka_usd,
-                "camera_profile": _camera_profile_metadata(args.camera_profile),
-                "camera_intrinsic_sources": camera_intrinsic_sources,
-                "camera_intrinsic_matrices": camera_intrinsic_matrices,
-                "camera_extrinsics": isaac_overrides,
-                "camera_roles": {
-                    "base": "third-person agentview",
-                    "top": "virtual auxiliary top-down XY alignment",
-                    "side": "virtual auxiliary side-view height and contact",
-                    "wrist": "Franka panda_hand wrist view",
-                },
-                "automatic_outcome_available": cube_lift_evaluator is not None,
-                "scene_geometry": scene_geometry,
-                "policy": (
-                    {
+                "gello_joint_targets": [
+                    *[f"panda_joint{index}_rad" for index in range(1, 8)],
+                    "gripper_closed",
+                ],
+                "retargeted_trajectory": [
+                    "target_x_m", "target_y_m", "target_z_m", "target_qw", "target_qx",
+                    "target_qy", "target_qz", "gripper_closed",
+                ],
+            },
+            "keyboard_mapping": KEYBOARD_AXIS_COMMANDS,
+            "keyboard_position_step_m": args.keyboard_position_step_m,
+            "keyboard_rotation_step_rad": args.keyboard_rotation_step_rad,
+            "keyboard_ik": {
+                "command_type": "pose",
+                "use_relative_mode": True,
+                "method": "dls",
+            },
+            "dataset_fps": args.dataset_fps,
+            "preview_fps": args.preview_fps,
+            "stream_fps": args.stream_fps,
+            "franka_usd": args.franka_usd,
+            "camera_profile": _camera_profile_metadata(args.camera_profile),
+            "camera_intrinsic_sources": camera_intrinsic_sources,
+            "camera_intrinsic_matrices": camera_intrinsic_matrices,
+            "camera_extrinsics": isaac_overrides,
+            "camera_roles": {
+                "base": "third-person agentview",
+                "top": "virtual auxiliary top-down XY alignment",
+                "side": "virtual auxiliary side-view height and contact",
+                "wrist": "Franka panda_hand wrist view",
+            },
+            "automatic_outcome_available": cube_lift_evaluator is not None,
+            "scene_geometry": scene_geometry,
+            "git_roots": {"gello_remote": Path(__file__).resolve().parents[2]},
+            "dependency_packages": ["isaacsim", "numpy"],
+        }
+
+        def make_episode_writer(
+            *,
+            control_source: str,
+            operator_command_names: list[str],
+            seed: int,
+            generation_method: str | None = None,
+            lineage: object | None = None,
+            metadata: dict[str, object] | None = None,
+        ):
+            run_metadata = dict(base_run_metadata)
+            run_metadata["control_source"] = control_source
+            if metadata:
+                run_metadata.update(metadata)
+            return FrankaEpisodeWriter(
+                args.data_dir,
+                fps=int(round(args.dataset_fps)),
+                engine_id="isaac_sim",
+                engine_version=engine_version,
+                scene_id=args.scene,
+                seed=seed,
+                worker_id="gello_remote_isaac_sim",
+                control_source=control_source,
+                state_names=state_names,
+                action_names=action_names,
+                operator_command_names=operator_command_names,
+                camera_names=list(CAMERA_NAMES),
+                run_metadata=run_metadata,
+                generation_method=generation_method,
+                lineage=lineage,
+            )
+
+        if args.control_source != "trajectory":
+            control_source = (
+                "browser_se3_keyboard"
+                if args.control_source == "keyboard"
+                else ("openpi_policy" if args.control_source == "openpi" else "gello_joint_targets")
+            )
+            operator_command_names = (
+                ["dx_m", "dy_m", "dz_m", "droll_rad", "dpitch_rad", "dyaw_rad", "gripper_closed"]
+                if args.control_source == "keyboard"
+                else (
+                    [
+                        *(f"model_target_joint/panda_joint{index}_rad" for index in range(1, 8)),
+                        "model_target_gripper_closed_fraction",
+                    ]
+                    if args.control_source == "openpi"
+                    else [f"requested_joint_position/panda_joint{index}_rad" for index in range(1, 8)]
+                    + ["requested_gripper_closed"]
+                )
+            )
+            policy_metadata = (
+                {
+                    "policy": {
                         "consumer": "openpi_franka_joint8",
                         "config": args.policy_config,
                         "checkpoint": str(args.policy_checkpoint),
@@ -1838,15 +2050,471 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                             "min_closed_frames": args.gripper_min_closed_frames,
                         },
                         "full_horizon": args.full_horizon,
+                        "evaluation_plan": (
+                            str(args.evaluation_plan) if args.evaluation_plan else None
+                        ),
                     }
-                    if args.control_source == "openpi"
-                    else None
-                ),
-                "git_roots": {"gello_remote": Path(__file__).resolve().parents[2]},
-                "dependency_packages": ["isaacsim", "numpy"],
-            },
-            generation_method=("policy_rollout" if args.control_source == "openpi" else None),
+                }
+                if args.control_source == "openpi"
+                else None
+            )
+            writer = make_episode_writer(
+                control_source=control_source,
+                operator_command_names=operator_command_names,
+                seed=args.seed,
+                generation_method=("policy_rollout" if args.control_source == "openpi" else None),
+                metadata=policy_metadata,
+            )
+
+    if args.control_source == "trajectory":
+        from robot_data_generation.generation_plan import (
+            load_batch_report,
+            load_generation_plan,
+            new_batch_report,
+            pending_attempts,
+            record_attempt_result,
+            write_json_atomic,
         )
+        from robot_data_generation.models import AttemptResultV1, SourceEpisodeRefV1
+        from robot_data_generation.rigid_retarget import retarget_rigid_cube_lift
+        from robot_data_generation.source_episode import load_source_trajectory
+
+        if make_episode_writer is None or cube_lift_evaluator is None or task_object is None:
+            raise RuntimeError(
+                "trajectory execution requires episode writer, cube evaluator, and task object"
+            )
+        plan = load_generation_plan(args.generation_plan)
+        if plan.execution is None:
+            raise RuntimeError(
+                "trajectory execution requires a v2 plan with resolved execution settings"
+            )
+        if not math.isclose(
+            args.control_hz,
+            plan.execution.control_hz,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ):
+            raise RuntimeError(
+                f"--control_hz={args.control_hz} does not match resolved plan "
+                f"control_hz={plan.execution.control_hz}"
+            )
+        output_root = Path(args.data_dir).expanduser().resolve()
+        report_path = output_root / "generation_batch_report.json"
+        if report_path.exists():
+            if not args.resume_generation:
+                raise RuntimeError(
+                    f"generation report already exists: {report_path}; use --resume-generation"
+                )
+            report = load_batch_report(report_path, plan=plan)
+        else:
+            if args.resume_generation:
+                raise RuntimeError(
+                    f"cannot resume because generation report does not exist: {report_path}"
+                )
+            report = new_batch_report(plan, args.generation_plan)
+            write_json_atomic(report_path, report)
+
+        source_cache: dict[str, tuple[object, np.ndarray]] = {}
+        trajectory_controller = GelloCommandController(
+            initial_joint_positions,
+            backend.joint_position_limits(),
+            control_hz=args.control_hz,
+            max_joint_speed=args.max_joint_speed,
+            watchdog_timeout=args.gello_timeout,
+        )
+        physics_steps_per_control = control_decimation
+        dataset_control_decimation = args.dataset_control_decimation
+        pregrasp_timeout_ticks = int(
+            math.ceil(plan.execution.pregrasp_timeout_s * args.control_hz)
+        )
+
+        attempt_order = {
+            attempt.attempt_id: index for index, attempt in enumerate(plan.attempts)
+        }
+
+        for attempt in pending_attempts(plan, report):
+            attempt_writer = None
+            episode_path: Path | None = None
+            metrics: dict[str, object] = {}
+            try:
+                np.random.seed(attempt.randomization_seed)
+                torch.manual_seed(attempt.randomization_seed)
+                source_key = str(attempt.source_episode_path)
+                cached_source = source_cache.get(source_key)
+                if cached_source is None:
+                    source = load_source_trajectory(
+                        SourceEpisodeRefV1(
+                            path=attempt.source_episode_path,
+                            episode_uuid=attempt.source_episode_uuid,
+                        ),
+                        grasp_lift_threshold_m=(
+                            plan.execution.grasp_lift_threshold_m
+                        ),
+                        task_lift_threshold_m=plan.execution.task_lift_threshold_m,
+                    )
+                    controller_target_pose = recover_controller_target_poses(
+                        source.applied_action
+                    )
+                    source_cache[source_key] = (source, controller_target_pose)
+                else:
+                    source, controller_target_pose = cached_source
+                trajectory = retarget_rigid_cube_lift(
+                    source,
+                    controller_target_pose,
+                    attempt.object_xy_offset_m,
+                    transition_frames=attempt.transition_frames,
+                    target_hz=plan.execution.control_hz,
+                )
+                max_control_steps = int(
+                    args.max_episode_frames * dataset_control_decimation
+                )
+                worst_case_control_steps = trajectory.length + pregrasp_timeout_ticks
+                if worst_case_control_steps > max_control_steps:
+                    raise ValueError(
+                        f"trajectory may require {worst_case_control_steps} control ticks, "
+                        f"exceeding the {max_control_steps}-tick dataset horizon"
+                    )
+
+                reset_task_assets(trajectory.object_start_position_m)
+                trajectory_controller.reset_targets(initial_joint_positions)
+                trajectory_ik_controller.reset()
+                cube_lift_evaluator = CubeLiftEvaluator(
+                    fps=int(round(args.control_hz)),
+                    initial_object_z_m=trajectory.object_start_position_m[2],
+                    grasp_threshold_m=plan.execution.grasp_lift_threshold_m,
+                    lift_threshold_m=plan.execution.task_lift_threshold_m,
+                    success_mode=plan.execution.success_mode,
+                )
+                lineage = AugmentationLineageV1(
+                    parent_episode_uuid=attempt.source_episode_uuid,
+                    generation_method=(
+                        "physics_replay" if plan.nominal_only else "retargeted"
+                    ),
+                    randomization_spec_id=plan.spec_id,
+                    randomization_seed=attempt.randomization_seed,
+                    resolved_parameters={
+                        "attempt_id": attempt.attempt_id,
+                        "object_xy_offset_m": list(attempt.object_xy_offset_m),
+                        "object_start_position_m": list(
+                            trajectory.object_start_position_m
+                        ),
+                        "transition_frames": attempt.transition_frames,
+                        "source_pose_reconstruction": "isaac_fk_from_applied_action",
+                        "source_fps": source.fps,
+                        "execution_control_hz": plan.execution.control_hz,
+                        "pose_interpolation": "linear_position_shortest_path_slerp",
+                        "pregrasp_position_tolerance_m": (
+                            plan.execution.pregrasp_position_tolerance_m
+                        ),
+                        "pregrasp_rotation_tolerance_rad": (
+                            plan.execution.pregrasp_rotation_tolerance_rad
+                        ),
+                        "pregrasp_stable_ticks": plan.execution.pregrasp_stable_ticks,
+                        "pregrasp_timeout_s": plan.execution.pregrasp_timeout_s,
+                        "success_mode": plan.execution.success_mode,
+                        "nominal_only": plan.nominal_only,
+                    },
+                    trajectory_modified=not plan.nominal_only,
+                )
+                attempt_writer = make_episode_writer(
+                    control_source="retargeted_trajectory",
+                    operator_command_names=[
+                        "target_x_m",
+                        "target_y_m",
+                        "target_z_m",
+                        "target_qw",
+                        "target_qx",
+                        "target_qy",
+                        "target_qz",
+                        "gripper_closed",
+                    ],
+                    seed=attempt.randomization_seed,
+                    lineage=lineage,
+                    metadata={
+                        "generation_plan": str(args.generation_plan),
+                        "generation_attempt_id": attempt.attempt_id,
+                        "source_episode_path": str(attempt.source_episode_path),
+                    },
+                )
+                attempt_writer.start(source.task)
+
+                pregrasp_gate = PoseConvergenceGate(
+                    position_tolerance_m=(
+                        plan.execution.pregrasp_position_tolerance_m
+                    ),
+                    rotation_tolerance_rad=(
+                        plan.execution.pregrasp_rotation_tolerance_rad
+                    ),
+                    required_stable_ticks=plan.execution.pregrasp_stable_ticks,
+                    timeout_ticks=pregrasp_timeout_ticks,
+                )
+                pregrasp_converged = False
+                waypoint_index = 0
+                control_step_index = 0
+                max_tracking_position_error_m = 0.0
+                max_tracking_rotation_error_rad = 0.0
+                final_pregrasp_position_error_m: float | None = None
+                final_pregrasp_rotation_error_rad: float | None = None
+
+                while waypoint_index < trajectory.length:
+                    if not simulation_app.is_running():
+                        raise RuntimeError(
+                            "Isaac application stopped during trajectory execution"
+                        )
+                    if control_step_index >= max_control_steps:
+                        raise RuntimeError("trajectory exceeded the resolved control horizon")
+
+                    target_pose = trajectory.target_ee_pose[waypoint_index]
+                    waiting_for_pregrasp = (
+                        waypoint_index == trajectory.close_waypoint_index
+                        and not pregrasp_converged
+                    )
+                    desired_joints = trajectory_joint_targets(target_pose)
+                    gripper_closed = (
+                        False
+                        if waiting_for_pregrasp
+                        else bool(trajectory.gripper_closed[waypoint_index])
+                    )
+                    sequence = (
+                        attempt_order[attempt.attempt_id] * max_control_steps
+                        + control_step_index
+                    )
+                    command_timestamp_ns = time.time_ns()
+                    command_receive_ns = time.monotonic_ns()
+                    accepted = trajectory_controller.submit(
+                        GelloCommand(
+                            session_id="trajectory-batch",
+                            sequence=sequence,
+                            timestamp_ns=command_timestamp_ns,
+                            joint_targets=desired_joints,
+                            gripper_closed=gripper_closed,
+                        )
+                    )
+                    if not accepted:
+                        raise RuntimeError(
+                            f"trajectory command sequence {sequence} was rejected"
+                        )
+                    safe_command = trajectory_controller.tick()
+                    requested_finger = (
+                        FRANKA_GRIPPER_CLOSED_M if gripper_closed else 0.04
+                    )
+                    applied_finger = (
+                        FRANKA_GRIPPER_CLOSED_M
+                        if safe_command.gripper_closed
+                        else 0.04
+                    )
+                    requested_native = np.asarray(
+                        (*desired_joints, requested_finger, requested_finger),
+                        dtype=np.float32,
+                    )
+                    safe_native = np.asarray(
+                        (*safe_command.joint_targets, applied_finger, applied_finger),
+                        dtype=np.float32,
+                    )
+                    arm_positions = backend.current_joint_positions()
+                    finger_positions = backend.current_gripper_positions()
+                    arm_velocities = backend.current_joint_velocities()
+                    finger_velocities = backend.current_gripper_velocities()
+                    state = np.asarray(
+                        (*arm_positions, *finger_positions, *arm_velocities, *finger_velocities),
+                        dtype=np.float32,
+                    )
+                    ee_pose = (
+                        robot.data.body_pose_w.torch[0, hand_body_index]
+                        .detach()
+                        .cpu()
+                        .numpy()
+                    )
+                    object_pose = task_object.data.root_pose_w.torch[0].detach().cpu().numpy()
+                    object_velocity = (
+                        task_object.data.root_vel_w.torch[0].detach().cpu().numpy()
+                    )
+                    position_error, rotation_error = _pose_tracking_error(
+                        ee_pose, target_pose
+                    )
+                    max_tracking_position_error_m = max(
+                        max_tracking_position_error_m, position_error
+                    )
+                    max_tracking_rotation_error_rad = max(
+                        max_tracking_rotation_error_rad, rotation_error
+                    )
+
+                    if control_step_index % dataset_control_decimation == 0:
+                        for camera in record_cameras.values():
+                            camera.update(dt=sim_dt)
+                        images = {
+                            name: camera.data.output["rgb"].torch[0].detach().cpu().numpy()
+                            for name, camera in record_cameras.items()
+                        }
+                        attempt_writer.add_frame(
+                            images=images,
+                            state=state,
+                            action=safe_native,
+                            requested_action=requested_native,
+                            safe_action=safe_native,
+                            applied_action=safe_native,
+                            operator_command=np.asarray(
+                                (*target_pose, float(gripper_closed)), dtype=np.float32
+                            ),
+                            sim_time=control_step_index / args.control_hz,
+                            control_sequence=sequence,
+                            control_timestamp_ns=command_timestamp_ns,
+                            control_receive_timestamp_ns=command_receive_ns,
+                            capture_timestamp_ns=time.monotonic_ns(),
+                            ee_pose=ee_pose,
+                            target_ee_pose=target_pose,
+                            object_pose=object_pose,
+                            object_velocity=object_velocity,
+                            extra_arrays={
+                                "source_frame_index": np.asarray(
+                                    [trajectory.source_frame_index[waypoint_index]],
+                                    dtype=np.int64,
+                                ),
+                                "source_frame_coordinate": np.asarray(
+                                    [trajectory.source_frame_coordinate[waypoint_index]],
+                                    dtype=np.float32,
+                                ),
+                                "trajectory_phase_id": np.asarray(
+                                    [trajectory.phase_id[waypoint_index]], dtype=np.int8
+                                ),
+                                "pregrasp_gate_active": np.asarray(
+                                    [waiting_for_pregrasp], dtype=np.bool_
+                                ),
+                                "target_position_error_m": np.asarray(
+                                    [position_error], dtype=np.float32
+                                ),
+                                "target_rotation_error_rad": np.asarray(
+                                    [rotation_error], dtype=np.float32
+                                ),
+                            },
+                        )
+                    backend.set_command(
+                        safe_command.joint_targets,
+                        gripper_closed=safe_command.gripper_closed,
+                    )
+                    for _ in range(physics_steps_per_control):
+                        sim.step()
+                        robot.update(sim_dt)
+                        task_object.update(sim_dt)
+                        _pump_kit_frame(simulation_app)
+                    cube_lift_evaluator.update(
+                        object_z_m=float(task_object.data.root_pos_w.torch[0, 2].item()),
+                        gripper_closed=safe_command.gripper_closed,
+                    )
+
+                    if waiting_for_pregrasp:
+                        post_step_pose = (
+                            robot.data.body_pose_w.torch[0, hand_body_index]
+                            .detach()
+                            .cpu()
+                            .numpy()
+                        )
+                        gate_status, final_pregrasp_position_error_m, final_pregrasp_rotation_error_rad = (
+                            pregrasp_gate.update(post_step_pose, target_pose)
+                        )
+                        if gate_status == "timed_out":
+                            raise RuntimeError(
+                                "pregrasp convergence timed out before gripper close"
+                            )
+                        if gate_status == "converged":
+                            pregrasp_converged = True
+                    else:
+                        waypoint_index += 1
+                    control_step_index += 1
+
+                metrics = cube_lift_evaluator.result()
+                metrics.update(
+                    {
+                        "control_steps": control_step_index,
+                        "recorded_frames": attempt_writer.frame_count,
+                        "pregrasp_converged": pregrasp_converged,
+                        "pregrasp_wait_ticks": pregrasp_gate.elapsed_ticks,
+                        "final_pregrasp_position_error_m": (
+                            final_pregrasp_position_error_m
+                        ),
+                        "final_pregrasp_rotation_error_rad": (
+                            final_pregrasp_rotation_error_rad
+                        ),
+                        "max_tracking_position_error_m": (
+                            max_tracking_position_error_m
+                        ),
+                        "max_tracking_rotation_error_rad": (
+                            max_tracking_rotation_error_rad
+                        ),
+                    }
+                )
+                succeeded = bool(metrics["success"])
+                episode_path = attempt_writer.finish(
+                    operator_success=None,
+                    auto_success=succeeded,
+                    episode_metrics={
+                        key: value for key, value in metrics.items() if key != "success"
+                    },
+                    evaluator_id="isaac_cube_lift_retarget_v2",
+                    evaluator_version="2",
+                )
+                result = AttemptResultV1(
+                    attempt_id=attempt.attempt_id,
+                    status="succeeded" if succeeded else "failed",
+                    episode_path=episode_path,
+                    error=None if succeeded else "automatic_criterion_not_met",
+                    metrics=metrics,
+                )
+            except (OSError, RuntimeError, ValueError) as exc:
+                if attempt_writer is not None and attempt_writer.is_recording:
+                    if attempt_writer.frame_count:
+                        metrics = cube_lift_evaluator.result()
+                        episode_path = attempt_writer.finish(
+                            operator_success=False,
+                            auto_success=False,
+                            episode_metrics={
+                                **{key: value for key, value in metrics.items() if key != "success"},
+                                "runtime_error": str(exc),
+                            },
+                            evaluator_id="isaac_cube_lift_retarget_v2",
+                            evaluator_version="2",
+                        )
+                    else:
+                        attempt_writer.discard()
+                result = AttemptResultV1(
+                    attempt_id=attempt.attempt_id,
+                    status="failed",
+                    episode_path=episode_path,
+                    error=f"{type(exc).__name__}: {exc}",
+                    metrics=metrics,
+                )
+            report = record_attempt_result(report, result)
+            write_json_atomic(report_path, report)
+            print(
+                "ISAAC_TRAJECTORY_ATTEMPT " + result.model_dump_json(),
+                file=sys.__stderr__,
+                flush=True,
+            )
+            if not simulation_app.is_running():
+                raise RuntimeError("Isaac application stopped; generation report is resumable")
+
+        successes = sum(result.status == "succeeded" for result in report.results)
+        gate_passed = (
+            successes == report.requested_attempts
+            if plan.nominal_only
+            else successes * 2 >= report.requested_attempts
+        )
+        summary = {
+            "status": report.status,
+            "gate_passed": gate_passed,
+            "gate": "all nominal attempts" if plan.nominal_only else "at least 50 percent",
+            "requested_attempts": report.requested_attempts,
+            "completed_attempts": len(report.results),
+            "successful_attempts": successes,
+            "failed_attempts": len(report.results) - successes,
+            "report_path": str(report_path),
+        }
+        print(
+            "ISAAC_TRAJECTORY_BATCH " + json.dumps(summary, sort_keys=True),
+            file=sys.__stderr__,
+            flush=True,
+        )
+        return gate_passed
 
     if args.control_source == "openpi":
         from openpi_client.websocket_client_policy import WebsocketClientPolicy
@@ -1857,6 +2525,10 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
             encode_policy_state,
             encode_videos,
             validate_action_chunk,
+        )
+        from robot_data_generation.evaluation_plan import (
+            evaluation_plan_sha256,
+            load_evaluation_plan,
         )
 
         if writer is None or cube_lift_evaluator is None or task_object is None:
@@ -1898,6 +2570,22 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
         output_root = Path(args.data_dir).expanduser().resolve()
         batch_report_path = output_root / "batch_report.json"
         batch_csv_path = output_root / "rollouts.csv"
+        if batch_report_path.exists():
+            raise RuntimeError(
+                f"OpenPI batch report already exists; choose a new --data-dir: {batch_report_path}"
+            )
+        evaluation_plan = (
+            load_evaluation_plan(args.evaluation_plan) if args.evaluation_plan else None
+        )
+        evaluation_digest = (
+            evaluation_plan_sha256(evaluation_plan) if evaluation_plan else None
+        )
+        conditions = (
+            list(evaluation_plan.conditions) if evaluation_plan else [None] * args.rollout_count
+        )
+        if args.evaluation_limit is not None:
+            conditions = conditions[: args.evaluation_limit]
+        requested_rollouts = len(conditions)
         rollout_reports: list[dict[str, Any]] = []
 
         def write_batch_report(*, completed: bool) -> None:
@@ -1906,8 +2594,11 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                 "status": "completed" if completed else "running",
                 "scene": args.scene,
                 "fixed_training_distribution": True,
+                "heldout_evaluation": evaluation_plan is not None,
                 "generalization_claimed": False,
-                "requested_rollouts": args.rollout_count,
+                "evaluation_plan": str(args.evaluation_plan) if args.evaluation_plan else None,
+                "evaluation_plan_sha256": evaluation_digest,
+                "requested_rollouts": requested_rollouts,
                 "completed_rollouts": len(rollout_reports),
                 "policy_config": args.policy_config,
                 "policy_checkpoint": str(args.policy_checkpoint),
@@ -1926,6 +2617,9 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
             )
             fieldnames = [
                 "rollout_index",
+                "condition_id",
+                "object_x_offset_m",
+                "object_y_offset_m",
                 "episode_path",
                 "success",
                 "grasp",
@@ -1951,6 +2645,9 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                     table.writerow(
                         {
                             "rollout_index": report["rollout_index"],
+                            "condition_id": report["condition_id"],
+                            "object_x_offset_m": report["object_xy_offset_m"][0],
+                            "object_y_offset_m": report["object_xy_offset_m"][1],
                             "episode_path": report["episode_path"],
                             "success": report["success"],
                             "grasp": metrics["grasp"],
@@ -1966,8 +2663,22 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                         }
                     )
 
-        for rollout_index in range(args.rollout_count):
-            reset_task_assets()
+        for rollout_index, condition in enumerate(conditions):
+            object_offset = (
+                tuple(condition.object_xy_offset_m) if condition is not None else (0.0, 0.0)
+            )
+            object_start = (
+                float(scene_geometry["object_start_m"][0]) + object_offset[0],
+                float(scene_geometry["object_start_m"][1]) + object_offset[1],
+                float(scene_geometry["object_start_m"][2]),
+            )
+            condition_id = (
+                condition.condition_id if condition is not None else f"nominal-{rollout_index:03d}"
+            )
+            condition_seed = condition.rollout_seed if condition is not None else args.seed + rollout_index
+            np.random.seed(condition_seed % (2**32))
+            torch.manual_seed(condition_seed)
+            reset_task_assets(object_start)
             policy_controller.reset_targets(initial_joint_positions)
             cube_lift_evaluator.reset()
             gripper_filter.reset()
@@ -2073,6 +2784,12 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                         "policy_gripper_filtered_closed": np.asarray(
                             [gripper_closed], dtype=np.bool_
                         ),
+                        "evaluation_object_xy_offset_m": np.asarray(
+                            object_offset, dtype=np.float32
+                        ),
+                        "evaluation_condition_seed": np.asarray(
+                            [condition_seed], dtype=np.int64
+                        ),
                     },
                 )
                 backend.set_command(
@@ -2123,6 +2840,10 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
             )
             report = {
                 "rollout_index": rollout_index,
+                "condition_id": condition_id,
+                "condition_seed": condition_seed,
+                "object_xy_offset_m": list(object_offset),
+                "object_start_position_m": list(object_start),
                 "episode_index": episode_index,
                 "episode_path": str(episode_path),
                 "success": bool(metrics["success"]),

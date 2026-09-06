@@ -9,6 +9,7 @@ from websockets.datastructures import Headers
 
 from gello_remote.isaaclab_gello import (
     CAMERA_NAMES,
+    CONTROL_SOURCES,
     CameraPreviewStore,
     BrowserSe3KeyboardState,
     CubeLiftEvaluator,
@@ -19,6 +20,7 @@ from gello_remote.isaaclab_gello import (
     PREVIEW_HEADER,
     PREVIEW_MAGIC,
     PREVIEW_PROTOCOL_VERSION,
+    PoseConvergenceGate,
     RecordingCommandStore,
     STREAM_HEIGHT,
     STREAM_SCENE_PRIMS,
@@ -43,6 +45,10 @@ from gello_remote.isaaclab_gello import (
     _required_scene_prims,
     _running_control_services,
 )
+
+
+def test_trajectory_is_an_explicit_control_source() -> None:
+    assert "trajectory" in CONTROL_SOURCES
 
 
 def keyboard_message(
@@ -249,6 +255,51 @@ def test_cube_lift_evaluator_does_not_call_close_alone_a_grasp() -> None:
     assert result["close_seen"] is True
     assert result["grasp"] is False
     assert result["lift"] is False
+
+
+def test_cube_lift_evaluator_lift_mode_accepts_without_hold_or_release() -> None:
+    evaluator = CubeLiftEvaluator(
+        fps=20, initial_object_z_m=0.277, success_mode="lift"
+    )
+
+    evaluator.update(object_z_m=0.367, gripper_closed=True)
+
+    result = evaluator.result()
+    assert result["success"] is True
+    assert result["lift"] is True
+    assert result["hold"] is False
+    assert result["release"] is False
+
+
+def test_cube_lift_evaluator_requires_task_height_while_closed() -> None:
+    evaluator = CubeLiftEvaluator(
+        fps=20, initial_object_z_m=0.277, success_mode="lift"
+    )
+    evaluator.update(object_z_m=0.307, gripper_closed=True)
+    evaluator.update(object_z_m=0.377, gripper_closed=False)
+
+    assert evaluator.result()["success"] is False
+    assert math.isclose(evaluator.result()["max_lift_m"], 0.1)
+    assert evaluator.result()["max_closed_lift_m"] < 0.08
+
+
+def test_pose_convergence_gate_requires_consecutive_stable_ticks() -> None:
+    gate = PoseConvergenceGate(
+        position_tolerance_m=0.003,
+        rotation_tolerance_rad=math.radians(5.0),
+        required_stable_ticks=2,
+        timeout_ticks=4,
+    )
+    target = (0.4, 0.0, 0.3, 1.0, 0.0, 0.0, 0.0)
+
+    assert gate.update((0.41, 0.0, 0.3, 1.0, 0.0, 0.0, 0.0), target)[0] == "waiting"
+    assert gate.update((0.402, 0.0, 0.3, -1.0, 0.0, 0.0, 0.0), target)[0] == "waiting"
+    status, position_error, rotation_error = gate.update(
+        (0.401, 0.0, 0.3, 1.0, 0.0, 0.0, 0.0), target
+    )
+    assert status == "converged"
+    assert position_error <= 0.003
+    assert rotation_error == 0.0
 
 
 def test_rollout_stage_summary_keeps_each_denominator_equal() -> None:
