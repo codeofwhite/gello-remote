@@ -124,6 +124,11 @@ arrays and rollout reports, and refuses to overwrite an existing
 `batch_report.json`. `--evaluation-limit 1` provides a bounded runtime smoke;
 do not mix that smoke directory with the formal paired batches.
 
+An evaluation plan may instead declare the `m2_train` split when every position
+is proven to have a successful M2 execution included in training. Batch reports
+record `evaluation_split` and set `heldout_evaluation` only for a true held-out
+plan; runs without a plan are labeled `nominal`.
+
 For a paired gripper-discretization diagnostic, keep the checkpoint, seed,
 scene, cameras, horizon, and policy RNG restart fixed. The legacy arm uses
 `--gripper-filter single_threshold --gripper-close-threshold 0.5`. The

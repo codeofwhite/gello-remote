@@ -530,6 +530,11 @@ def _rollout_stage_summary(reports: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _evaluation_position_split(evaluation_plan: Any | None) -> str:
+    """Name the position distribution used by a policy rollout batch."""
+    return evaluation_plan.position_split if evaluation_plan is not None else "nominal"
+
+
 def _scene_camera_overrides(
     profile: dict[str, Any], *, work_surface_top_m: float | None
 ) -> dict[str, dict[str, Any]]:
@@ -1361,7 +1366,7 @@ def _parse_args() -> tuple[argparse.Namespace, object]:
     parser.add_argument(
         "--evaluation-plan",
         type=Path,
-        help="leakage-checked held-out XY conditions for an OpenPI evaluation",
+        help="validated held-out or M2-training XY conditions for an OpenPI evaluation",
     )
     parser.add_argument(
         "--evaluation-limit",
@@ -2580,6 +2585,7 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
         evaluation_digest = (
             evaluation_plan_sha256(evaluation_plan) if evaluation_plan else None
         )
+        evaluation_split = _evaluation_position_split(evaluation_plan)
         conditions = (
             list(evaluation_plan.conditions) if evaluation_plan else [None] * args.rollout_count
         )
@@ -2594,7 +2600,8 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                 "status": "completed" if completed else "running",
                 "scene": args.scene,
                 "fixed_training_distribution": True,
-                "heldout_evaluation": evaluation_plan is not None,
+                "evaluation_split": evaluation_split,
+                "heldout_evaluation": evaluation_split == "heldout",
                 "generalization_claimed": False,
                 "evaluation_plan": str(args.evaluation_plan) if args.evaluation_plan else None,
                 "evaluation_plan_sha256": evaluation_digest,

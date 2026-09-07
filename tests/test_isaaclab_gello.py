@@ -32,6 +32,7 @@ from gello_remote.isaaclab_gello import (
     _configure_gpu_selection,
     _encode_preview_packet,
     _euler_xyz_to_rotation_vector,
+    _evaluation_position_split,
     _frequency_decimation,
     _camera_intrinsic_matrix,
     _camera_profile_metadata,
@@ -49,6 +50,12 @@ from gello_remote.isaaclab_gello import (
 
 def test_trajectory_is_an_explicit_control_source() -> None:
     assert "trajectory" in CONTROL_SOURCES
+
+
+def test_evaluation_position_split_distinguishes_nominal_and_planned_runs() -> None:
+    assert _evaluation_position_split(None) == "nominal"
+    assert _evaluation_position_split(SimpleNamespace(position_split="m2_train")) == "m2_train"
+    assert _evaluation_position_split(SimpleNamespace(position_split="heldout")) == "heldout"
 
 
 def keyboard_message(
