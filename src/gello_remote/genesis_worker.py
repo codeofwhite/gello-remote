@@ -935,7 +935,11 @@ async def ws_handler(websocket, server: TeleopServer) -> None:
         for session_id in bound_gello_session_ids:
             server.release_gello_session(session_id)
         server.clients.discard(websocket)
-        server.control.pressed_keys.clear()
+        # A key held at disconnect must not keep driving the arm: ``collector_loop``
+        # keeps stepping with no client attached. Clear every source, the same way
+        # the key-up path above does, so a dual scene clears both arms.
+        for source in server._keyboard_sources():
+            source.pressed_keys.clear()
 
 
 async def collector_loop(server: TeleopServer) -> None:
