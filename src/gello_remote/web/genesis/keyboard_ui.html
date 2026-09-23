@@ -15,6 +15,7 @@
     <div class="health-row" aria-label="系统状态">
       <span id="connection-chip" class="chip chip-warn">服务器连接中</span>
       <span id="mode-chip" class="chip chip-info">键盘模式</span>
+      <span id="active-arm-chip" class="chip chip-info" hidden>ACTIVE: LEFT</span>
       <span id="fps-chip" class="chip">0.0 FPS</span>
       <span id="latency-chip" class="chip">本地输入</span>
     </div>
@@ -35,17 +36,20 @@
         <div><span class="step-label">CONTROL</span><h2>键盘控制</h2></div>
         <span class="mode-lock">启动锁定</span>
       </div>
+      <p id="topology-notice" class="notice notice-neutral">正在读取场景臂拓扑…</p>
       <div class="keyboard-grid">
         <div><kbd>↑ ↓ ← →</kbd><span>平面移动 XY</span></div>
         <div><kbd>W / S</kbd><span>上升 / 下降</span></div>
         <div><kbd>A / D</kbd><span>偏航 Yaw</span></div>
         <div><kbd>Q / E</kbd><span>滚转 Roll</span></div>
         <div><kbd>Space</kbd><span>开合夹爪</span></div>
+        <div><kbd>Tab</kbd><span>切换激活臂</span></div>
         <div><kbd>R</kbd><span>环境复位</span></div>
+        <div><kbd>C / X</kbd><span>成功 / 失败保存</span></div>
       </div>
       <div class="safety-note">
         <strong>操作提示</strong>
-        <span>先用小步幅确认方向。此页面不会接收 GELLO 指令。</span>
+        <span id="safety-hint">先用小步幅确认方向。此页面不会接收 GELLO 指令。</span>
       </div>
       <details class="diagnostics">
         <summary>高级诊断</summary>

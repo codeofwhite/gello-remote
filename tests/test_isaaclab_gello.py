@@ -8,12 +8,14 @@ from types import SimpleNamespace
 from websockets.datastructures import Headers
 
 from gello_remote.isaaclab_gello import (
+    BIMANUAL_VISUAL_CAMERA_NAMES,
     CAMERA_NAMES,
     CONTROL_SOURCES,
     CameraPreviewStore,
     BrowserSe3KeyboardState,
     CubeLiftEvaluator,
     DEFAULT_CAMERA_PROFILE,
+    DEFAULT_RENDERER_PROFILE,
     DEFAULT_WORK_SURFACE_HEIGHT_M,
     GelloWebServer,
     PREVIEW_CAMERA_IDS,
@@ -29,6 +31,9 @@ from gello_remote.isaaclab_gello import (
     ViewCommandStore,
     WEB_CONSOLE_ROOT,
     _apply_split_gpu_launcher_config,
+    _apply_renderer_kit_settings,
+    _bimanual_tabletop_geometry,
+    _validate_bimanual_mount_bounds,
     _configure_gpu_selection,
     _encode_preview_packet,
     _euler_xyz_to_rotation_vector,
@@ -41,10 +46,17 @@ from gello_remote.isaaclab_gello import (
     _rollout_stage_summary,
     _scene_camera_overrides,
     _load_camera_profile,
+    _load_renderer_profile,
+    _load_static_link_pose,
+    _renderer_profile_kit_args,
+    _load_workstation_visual_asset,
     _missing_scene_prims,
     _pump_kit_frame,
     _required_scene_prims,
     _running_control_services,
+    _visual_demo_joint_targets,
+    _visual_demo_provenance,
+    _workstation_cube_lift_geometry,
 )
 
 
@@ -200,6 +212,32 @@ def test_rigid_cube_lift_geometry_has_no_placement_target() -> None:
     assert "hold for 1 second" in geometry["task_instruction"]
 
 
+def test_workstation_geometry_aligns_hidden_proxy_to_household_table() -> None:
+    geometry = _workstation_cube_lift_geometry(0.76)
+
+    assert geometry["work_surface_top_m"] == 0.76
+    assert geometry["work_surface_center_m"] == (0.55, -0.10, 0.38)
+    assert geometry["object_start_m"] == (0.55, -0.10, 0.787)
+    assert geometry["collision_policy"] == "hidden_table_proxy"
+    for invalid in (0.49, 1.01, math.nan):
+        try:
+            _workstation_cube_lift_geometry(invalid)
+        except ValueError as exc:
+            assert "table_top_z_m" in str(exc)
+        else:
+            raise AssertionError("expected invalid workstation surface height")
+
+
+def test_bimanual_tabletop_geometry_is_wide_and_centered() -> None:
+    geometry = _bimanual_tabletop_geometry(0.76)
+
+    assert geometry["work_surface_size_m"] == (1.20, 0.80, 0.76)
+    assert geometry["work_surface_center_m"] == (0.55, 0.0, 0.38)
+    assert geometry["object_start_m"] == (0.65, 0.0, 0.787)
+    assert geometry["bimanual_visual_only"] is True
+    assert geometry["collision_policy"] == "visual_only_no_table_proxy_collision"
+
+
 def test_pick_place_stream_validation_requires_target_zone() -> None:
     geometry = _rigid_pick_place_geometry(DEFAULT_WORK_SURFACE_HEIGHT_M)
 
@@ -342,6 +380,18 @@ def test_scene_camera_targets_follow_surface_without_mutating_profile() -> None:
         DEFAULT_CAMERA_PROFILE["engine_overrides"]["isaac_sim"]["base"]["target_world_m"]
         == original_target
     )
+
+
+def test_scene_camera_targets_can_preserve_authored_bimanual_framing() -> None:
+    overrides = _scene_camera_overrides(
+        DEFAULT_CAMERA_PROFILE,
+        work_surface_top_m=0.76,
+        task_center_xy=(0.55, 0.0),
+        preserve_authored_targets=True,
+    )
+
+    assert overrides["base"]["target_world_m"] == [0.45, 0.0, 0.65]
+    assert overrides["top"]["target_world_m"] == [0.45, 0.0, 0.45]
 
 
 def test_stream_and_recording_defaults_share_four_by_three_framing() -> None:
@@ -494,6 +544,253 @@ def test_lab_camera_profile_drives_dual_d435i_recording() -> None:
     assert metadata["match_level"] == "nominal_pending_intrinsics"
     assert metadata["roles"]["agentview"]["calibration_source_serial"] == "261722075807"
     assert metadata["roles"]["wrist"]["calibration_source_serial"] == "261622075579"
+
+
+def test_renderer_profile_records_exact_mode_version_and_hash() -> None:
+    path = (
+        Path(__file__).resolve().parents[2]
+        / "robot-data-studio/config/renderer_profiles/isaac_quality_v1.json"
+    )
+    profile = _load_renderer_profile(path)
+    assert profile["id"] == "isaac_quality_v1"
+    assert profile["profile_version"] == 1
+    assert profile["rendering_mode"] == "quality"
+    assert len(profile["profile_sha256"]) == 64
+    assert profile["profile_source"] == str(path.resolve())
+    assert _load_renderer_profile(None)["id"] == DEFAULT_RENDERER_PROFILE["id"]
+
+
+def test_pathtraced_workstation_profile_uses_explicit_rtx_settings() -> None:
+    path = (
+        Path(__file__).resolve().parents[2]
+        / "robot-data-studio/config/renderer_profiles/isaac_pathtraced_workstation_v1.json"
+    )
+    profile = _load_renderer_profile(path)
+    assert profile["rendering_mode"] == "quality"
+    assert profile["kit_settings"]["/rtx/rendermode"] == "PathTracing"
+    assert profile["kit_settings"]["/rtx/pathtracing/spp"] == 32
+    assert profile["kit_settings"]["/rtx/post/tonemap/cameraShutter"] == 100.0
+
+
+def test_pathtraced_workstation_v2_uses_usd_synchronized_transforms() -> None:
+    path = (
+        Path(__file__).resolve().parents[2]
+        / "robot-data-studio/config/renderer_profiles/isaac_pathtraced_workstation_v2.json"
+    )
+    profile = _load_renderer_profile(path)
+    assert profile["profile_version"] == 2
+    assert profile["kit_settings"][
+        "/rtx/hydra/readTransformsFromFabricInRenderDelegate"
+    ] is False
+
+
+def test_renderer_settings_are_applied_and_read_back_exactly() -> None:
+    class FakeSettings:
+        def __init__(self):
+            self.values = {}
+
+        def set(self, key, value):
+            self.values[key] = value
+
+        def get(self, key):
+            return self.values.get(key)
+
+    profile = {"kit_settings": {"/rtx/rendermode": "PathTracing", "/rtx/pathtracing/spp": 32}}
+    settings = FakeSettings()
+    assert _apply_renderer_kit_settings(settings, profile) == profile["kit_settings"]
+
+
+def test_renderer_profile_settings_are_serialized_for_kit_startup() -> None:
+    assert _renderer_profile_kit_args(
+        {"kit_settings": {"/example/enabled": False, "/example/spp": 32}}
+    ) == ["--/example/enabled=false", "--/example/spp=32"]
+
+
+def test_recorded_bimanual_link_pose_is_finite_and_complete() -> None:
+    path = (
+        Path(__file__).resolve().parents[2]
+        / "robot-data-studio/assets/sources/visual-workstation-v1"
+        / "bimanual_link_pose_transfer_v1.json"
+    )
+    pose = _load_static_link_pose(path)
+
+    assert pose["source_frame"] == 340
+    assert pose["source_phase"] == "TRANSFER"
+    assert len(pose["link_names"]) == 12
+    assert len(pose["robots"]["left"]["link_poses_world_xyzw"]) == 12
+    assert len(pose["robots"]["right"]["link_poses_world_xyzw"]) == 12
+
+
+def test_workstation_asset_loader_checks_hdri_hash(tmp_path) -> None:
+    import hashlib
+    import json
+
+    workstation = tmp_path / "workstation.usda"
+    workstation.write_text("#usda 1.0\n")
+    hdri = tmp_path / "light.hdr"
+    hdri.write_bytes(b"hdr")
+    digest = hashlib.sha256(b"hdr").hexdigest()
+    manifest = tmp_path / "asset_manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "format": "robot_data_visual_asset_pack",
+                "id": "household_workstation_v1",
+                "source": {"git_revision": "test"},
+                "composition": {"table_top_z_m": 0.76},
+                "hdri": {"sha256": digest, "license": "CC0"},
+                "limitations": ["test"],
+            }
+        )
+    )
+
+    value = _load_workstation_visual_asset(workstation, manifest, hdri)
+    assert value["asset_id"] == "SCN-household-workstation"
+    assert value["hdri_sha256"] == digest
+    assert value["composition"]["table_top_z_m"] == 0.76
+
+
+def test_bimanual_asset_loader_uses_manifest_registry_identity(tmp_path) -> None:
+    import hashlib
+    import json
+
+    workstation = tmp_path / "bimanual_tabletop.usda"
+    workstation.write_text("#usda 1.0\n")
+    hdri = tmp_path / "light.hdr"
+    hdri.write_bytes(b"hdr")
+    digest = hashlib.sha256(b"hdr").hexdigest()
+    manifest = tmp_path / "asset_manifest_bimanual.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "format": "robot_data_visual_asset_pack",
+                "id": "bimanual_tabletop_v1",
+                "registry": {
+                    "asset_id": "SCN-bimanual-tabletop",
+                    "asset_version": 1,
+                },
+                "source": {"git_revision": "test"},
+                "composition": {
+                    "table_top_z_m": 0.76,
+                    "robot_layout": {"mode": "fixed_bimanual_visual_only"},
+                },
+                "hdri": {"sha256": digest, "license": "CC0"},
+                "limitations": ["visual only"],
+            }
+        )
+    )
+
+    value = _load_workstation_visual_asset(workstation, manifest, hdri)
+    assert value["asset_id"] == "SCN-bimanual-tabletop"
+    assert value["manifest_id"] == "bimanual_tabletop_v1"
+    assert value["asset_version"] == 1
+
+
+def test_visual_demo_motion_is_deterministic_bounded_and_returns_home() -> None:
+    home = (0.0, -0.5, 0.0, -2.0, 0.0, 1.5, 0.7)
+    path = [
+        _visual_demo_joint_targets(home, control_step=step, total_control_steps=121)
+        for step in range(121)
+    ]
+
+    assert path[0] == home
+    assert all(math.isclose(actual, expected, abs_tol=1e-12) for actual, expected in zip(path[-1], home))
+    assert max(abs(target[0] - home[0]) for target in path) <= 0.28
+    assert max(abs(target[1] - home[1]) for target in path) <= 0.10
+    assert max(abs(target[3] - home[3]) for target in path) <= 0.12
+    assert max(abs(target[5] - home[5]) for target in path) <= 0.16
+    assert any(target != home for target in path[1:-1])
+
+
+def test_visual_demo_provenance_marks_visual_only_limitations() -> None:
+    args = SimpleNamespace(
+        scene="rigid_cube_lift",
+        visual_style="pbr_studio",
+        renderer_profile={"id": "isaac_quality_v1", "rendering_mode": "quality"},
+        camera_profile=_load_camera_profile(None, width=640, height=480),
+        width=640,
+        height=480,
+        dataset_fps=10.0,
+        physics_hz=120.0,
+        control_hz=20.0,
+        seed=7,
+    )
+    metadata = _visual_demo_provenance(
+        args,
+        frame_count=60,
+        videos={name: f"/{name}.mp4" for name in CAMERA_NAMES},
+    )
+
+    assert metadata["purpose"] == "renderer_and_scene_visual_comparison_only"
+    assert metadata["visual_style"] == "pbr_studio"
+    assert metadata["duration_seconds"] == 6.0
+    assert metadata["renderer_profile"]["id"] == "isaac_quality_v1"
+    assert any("not a claim of RoboDojo parity" in item for item in metadata["limitations"])
+
+
+def test_workstation_provenance_keeps_asset_and_nominal_camera_boundary() -> None:
+    args = SimpleNamespace(
+        scene="rigid_cube_lift",
+        visual_style="usd_workstation",
+        visual_asset={"asset_id": "SCN-household-workstation", "limitations": ["internal"]},
+        renderer_profile={"id": "isaac_pathtraced_workstation_v1", "rendering_mode": "quality"},
+        renderer_settings_readback={"/rtx/rendermode": "PathTracing"},
+        camera_profile=_load_camera_profile(None, width=640, height=480),
+        width=640,
+        height=480,
+        dataset_fps=10.0,
+        physics_hz=120.0,
+        control_hz=20.0,
+        seed=7,
+        visual_demo_elapsed_seconds=12.0,
+    )
+    metadata = _visual_demo_provenance(
+        args,
+        frame_count=60,
+        videos={name: f"/{name}.mp4" for name in CAMERA_NAMES},
+    )
+
+    assert metadata["visual_asset"]["asset_id"] == "SCN-household-workstation"
+    assert metadata["renderer_settings_readback"]["/rtx/rendermode"] == "PathTracing"
+    assert metadata["average_output_fps"] == 5.0
+    assert any("pending real photometric calibration" in item for item in metadata["limitations"])
+
+
+def test_bimanual_visual_provenance_records_static_layout_and_external_views() -> None:
+    layout = {
+        "mode": "fixed_bimanual_visual_only",
+        "left": {"prim_path": "/World/Franka"},
+        "right": {"prim_path": "/World/FrankaRight"},
+    }
+    args = SimpleNamespace(
+        scene="rigid_cube_lift",
+        visual_style="dual_franka_tabletop",
+        visual_asset={"asset_id": "SCN-bimanual-tabletop", "limitations": ["visual only"]},
+        visual_robot_layout=layout,
+        visual_camera_names=BIMANUAL_VISUAL_CAMERA_NAMES,
+        renderer_profile={"id": "isaac_pathtraced_workstation_v1", "rendering_mode": "quality"},
+        renderer_settings_readback={"/rtx/rendermode": "PathTracing"},
+        camera_profile=_load_camera_profile(None, width=640, height=480),
+        width=640,
+        height=480,
+        dataset_fps=10.0,
+        physics_hz=120.0,
+        control_hz=20.0,
+        seed=7,
+    )
+    metadata = _visual_demo_provenance(
+        args,
+        frame_count=10,
+        videos={name: f"/{name}.mp4" for name in BIMANUAL_VISUAL_CAMERA_NAMES},
+    )
+
+    assert metadata["camera_names"] == list(BIMANUAL_VISUAL_CAMERA_NAMES)
+    assert metadata["robot_layout"] == layout
+    assert metadata["visual_asset"]["asset_id"] == "SCN-bimanual-tabletop"
+    assert any(
+        "disables robot, table, and cube collision response" in item
+        for item in metadata["limitations"]
+    )
 
 
 def test_nominal_and_calibrated_intrinsic_matrix_sources_are_explicit() -> None:
@@ -755,3 +1052,70 @@ def test_server_starts_with_websockets_12_style_serve(monkeypatch) -> None:
     server.stop()
 
     assert transport.shutdown_called is True
+
+
+def test_lab_bench_dimensions_follow_manifest_and_bases_are_supported():
+    import pytest
+    from copy import deepcopy
+
+    c = {
+        "table_size_m": [1.6, .9, .76],
+        "table_top_z_m": .76,
+        "table_center_world_xy_m": [.55, 0],
+        "task_center_world_m": [.55, -.06, .76],
+        "minimum_base_edge_clearance_m": .05,
+        "mount_plate_size_m": [.3, .25, .012],
+        "mount_plate_top_z_m": .772,
+        "mount_plate_centers_world_xy_m": {"left": [-.04, .22], "right": [1.14, .22]},
+    }
+    geometry = _bimanual_tabletop_geometry(.76, c)
+    assert geometry["work_surface_size_m"] == (1.6, .9, .76)
+    assert geometry["object_start_m"][:2] == (.55, -.06)
+    table = ([-.25, -.45, .69], [1.35, .45, .76])
+    bases = {"left": ([-.1541, .1254, .772], [.0716, .3146, .912]),
+             "right": ([1.0284, .1254, .772], [1.2541, .3146, .912])}
+    report = _validate_bimanual_mount_bounds(c, table, bases)
+    assert report["left"]["minimum_table_edge_clearance_m"] > .095
+    overhang = deepcopy(bases)
+    overhang["left"][0][0] = -.26
+    with pytest.raises(ValueError, match="overhang"):
+        _validate_bimanual_mount_bounds(c, table, overhang)
+    floating = deepcopy(bases)
+    floating["right"][0][2] += .01
+    with pytest.raises(ValueError, match="floating"):
+        _validate_bimanual_mount_bounds(c, table, floating)
+    with pytest.raises(ValueError, match="dimensions"):
+        _validate_bimanual_mount_bounds(c, ([-.05, -.4, .69], [1.15, .4, .76]), bases)
+
+
+def test_static_pose_rejects_old_base_orientation_overriding_forward_layout(tmp_path):
+    import json
+    import pytest
+    q = [0, 0, -math.sqrt(.5), math.sqrt(.5)]
+    layout = {side: {"base_orientation_world_xyzw": q} for side in ("left", "right")}
+    payload = {"format": "robot_data_static_link_pose", "link_names": ["panda_link0"],
+               "robots": {side: {"source_base_position_world_m": [0, 0, 0],
+                                  "link_poses_world_xyzw": [[0, 0, 0, *q]]}
+                          for side in ("left", "right")}}
+    path = tmp_path / "pose.json"
+    path.write_text(json.dumps(payload))
+    _load_static_link_pose(path, layout)
+    payload["robots"]["right"]["link_poses_world_xyzw"][0][3:] = [-v for v in q]
+    path.write_text(json.dumps(payload))
+    _load_static_link_pose(path, layout)
+    payload["robots"]["left"]["link_poses_world_xyzw"][0][3:] = [0, 0, 0, 1]
+    path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="recorded base orientation"):
+        _load_static_link_pose(path, layout)
+
+
+def test_forward_bases_fit_rotated_mounts_with_rear_edge_clearance():
+    c = {"table_size_m": [1.6, .9, .76], "table_top_z_m": .76,
+         "table_center_world_xy_m": [.55, 0], "minimum_base_edge_clearance_m": .05,
+         "mount_plate_size_m": [.25, .3, .012], "mount_plate_top_z_m": .772,
+         "mount_plate_centers_world_xy_m": {"left": [0, .26], "right": [1.1, .26]}}
+    table = ([-.25, -.45, .69], [1.35, .45, .76])
+    bases = {"left": ([-.0946, .1484, .772], [.0946, .3741, .912]),
+             "right": ([1.0054, .1484, .772], [1.1946, .3741, .912])}
+    report = _validate_bimanual_mount_bounds(c, table, bases)
+    assert all(v["minimum_table_edge_clearance_m"] > .075 for v in report.values())

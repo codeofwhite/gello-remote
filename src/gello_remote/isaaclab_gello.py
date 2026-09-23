@@ -7,6 +7,8 @@ import csv
 from collections import deque
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
+from datetime import datetime, timezone
+import hashlib
 from http import HTTPStatus
 import json
 import math
@@ -14,13 +16,20 @@ import mimetypes
 import os
 from pathlib import Path
 import struct
+import subprocess
 import sys
 import threading
 import time
 import traceback
 from typing import Any
 
-from robot_data_contracts import CameraProfileV1, load_camera_profile
+from robot_data_contracts import (
+    CameraProfileV1,
+    RendererProfileV1,
+    load_camera_profile,
+    load_renderer_profile,
+    renderer_profile_metadata,
+)
 
 from .backends import FRANKA_GRIPPER_CLOSED_M, IsaacLabFrankaBackend
 from .control import FRANKA_HOME, GelloCommandController, GelloSessionGate
@@ -35,6 +44,12 @@ STREAM_WIDTH = 960
 STREAM_HEIGHT = 720
 STREAM_SCENE_PRIMS = ("/World/Franka", "/World/defaultGroundPlane", "/World/Light")
 ISAAC_SCENE_IDS = ("franka_empty", "rigid_pick_place", "rigid_cube_lift")
+VISUAL_STYLES = (
+    "baseline",
+    "pbr_studio",
+    "usd_workstation",
+    "dual_franka_tabletop",
+)
 DEFAULT_WORK_SURFACE_HEIGHT_M = 0.25
 MIN_WORK_SURFACE_HEIGHT_M = 0.18
 MAX_WORK_SURFACE_HEIGHT_M = 0.32
@@ -87,6 +102,17 @@ DEFAULT_CAMERA_PROFILE: dict[str, Any] = {
         }
     },
 }
+DEFAULT_RENDERER_PROFILE: dict[str, Any] = {
+    "format": "robot_data_renderer_profile",
+    "format_version": 1,
+    "profile_version": 1,
+    "id": "builtin_isaac_balanced_v1",
+    "label": "Built-in Isaac balanced renderer",
+    "description": "Compatibility default for direct worker launches.",
+    "engine_id": "isaac_sim",
+    "rendering_mode": "balanced",
+    "kit_settings": {},
+}
 GPU_KIT_SETTING_KEYS = (
     "--/renderer/activeGpu",
     "--/physics/cudaDevice",
@@ -96,6 +122,7 @@ GPU_KIT_SETTING_KEYS = (
     "--/renderer/multiGpu/maxGpuCount",
 )
 CAMERA_NAMES = ("base", "top", "side", "wrist")
+BIMANUAL_VISUAL_CAMERA_NAMES = ("base", "top", "left", "right")
 VIEW_NAMES = ("free", *CAMERA_NAMES)
 PREVIEW_CAMERA_IDS = {name: index for index, name in enumerate(CAMERA_NAMES)}
 PREVIEW_MAGIC = b"RDSC"
@@ -323,6 +350,403 @@ def _validate_work_surface_height(value: float) -> float:
     return height
 
 
+def _workstation_cube_lift_geometry(table_top_z_m: float) -> dict[str, object]:
+    """Return task geometry aligned to a household-height visual work surface."""
+    surface_z = float(table_top_z_m)
+    if not math.isfinite(surface_z) or not 0.5 <= surface_z <= 1.0:
+        raise ValueError("workstation table_top_z_m must be within [0.5, 1.0]")
+    object_size = 0.05
+    return {
+        "work_surface_center_m": (0.55, -0.10, surface_z / 2.0),
+        "work_surface_size_m": (0.70, 0.60, surface_z),
+        "work_surface_top_m": surface_z,
+        "object_size_m": object_size,
+        "object_start_m": (
+            0.55,
+            -0.10,
+            surface_z + object_size / 2.0 + 0.002,
+        ),
+        "task_instruction": (
+            "Grasp the cube on the household workstation, lift it at least 8 cm, "
+            "hold for 1 second, then release"
+        ),
+        "evaluator": {
+            "id": "isaac_cube_lift_v1",
+            "lift_threshold_m": CUBE_LIFT_THRESHOLD_M,
+            "hold_seconds": CUBE_HOLD_SECONDS,
+        },
+        "visual_workstation": True,
+        "collision_policy": "hidden_table_proxy",
+    }
+
+
+def _bimanual_tabletop_geometry(
+    table_top_z_m: float, composition: dict[str, Any] | None = None
+) -> dict[str, object]:
+    """Return the wide-table geometry used by the static dual-arm view."""
+    surface_z = float(table_top_z_m)
+    if not math.isfinite(surface_z) or not 0.5 <= surface_z <= 1.0:
+        raise ValueError("bimanual table_top_z_m must be within [0.5, 1.0]")
+    table_size = (1.20, 0.80, surface_z)
+    table_center = (0.55, 0.0)
+    object_xy = (0.65, 0.0)
+    if composition is not None:
+        table_size = tuple(float(v) for v in composition["table_size_m"])
+        table_center = tuple(float(v) for v in composition.get("table_center_world_xy_m", (0.55, 0.0)))
+        object_xy = tuple(float(v) for v in composition["task_center_world_m"][:2])
+        if (len(table_size) != 3 or len(table_center) != 2 or len(object_xy) != 2
+                or not all(math.isfinite(v) for v in (*table_size, *table_center, *object_xy))
+                or min(table_size) <= 0 or abs(table_size[2] - surface_z) > 1e-6):
+            raise ValueError("invalid bimanual table dimensions or center")
+    object_size = 0.05
+    return {
+        "work_surface_center_m": (*table_center, surface_z / 2.0),
+        "work_surface_size_m": table_size,
+        "work_surface_top_m": surface_z,
+        "object_size_m": object_size,
+        "object_start_m": (*object_xy, surface_z + object_size / 2.0 + 0.002),
+        "task_instruction": "Static dual-Franka tabletop visual preview",
+        "evaluator": {
+            "id": "visual_only_no_task_evaluator",
+            "lift_threshold_m": CUBE_LIFT_THRESHOLD_M,
+            "hold_seconds": CUBE_HOLD_SECONDS,
+        },
+        "visual_workstation": True,
+        "bimanual_visual_only": True,
+        "collision_policy": "visual_only_no_table_proxy_collision",
+    }
+
+
+
+def _validate_bimanual_mount_bounds(
+    composition: dict[str, Any],
+    table_bounds: tuple[list[float], list[float]],
+    base_bounds: dict[str, tuple[list[float], list[float]]],
+) -> dict[str, Any]:
+    """Reject overhanging or floating bases using composed USD mesh bounds."""
+    lo, hi = table_bounds
+    if not all(math.isfinite(v) for v in (*lo, *hi)) or any(a >= b for a, b in zip(lo, hi)):
+        raise ValueError("invalid tabletop mesh bounds")
+    center = composition["table_center_world_xy_m"]
+    size = composition["table_size_m"]
+    if any(abs((hi[i] - lo[i]) - size[i]) > 1e-4 or abs((hi[i] + lo[i]) / 2 - center[i]) > 1e-4 for i in (0, 1)):
+        raise ValueError("tabletop mesh differs from manifest dimensions")
+    if abs(hi[2] - composition["table_top_z_m"]) > 1e-4:
+        raise ValueError("tabletop mesh differs from manifest height")
+    required = float(composition["minimum_base_edge_clearance_m"])
+    plate_size = composition["mount_plate_size_m"]
+    report = {}
+    for side in ("left", "right"):
+        lower, upper = base_bounds[side]
+        if not all(math.isfinite(v) for v in (*lower, *upper)) or any(a >= b for a, b in zip(lower, upper)):
+            raise ValueError(f"{side} invalid base mesh bounds")
+        clearance = min(*(lower[i] - lo[i] for i in (0, 1)), *(hi[i] - upper[i] for i in (0, 1)))
+        if clearance < required - 1e-5:
+            raise ValueError(f"{side} base overhang or insufficient table edge clearance: {clearance:.6f} m")
+        plate_center = composition["mount_plate_centers_world_xy_m"][side]
+        for i in (0, 1):
+            plate_lo, plate_hi = plate_center[i] - plate_size[i] / 2, plate_center[i] + plate_size[i] / 2
+            if plate_lo < lo[i] or plate_hi > hi[i] or lower[i] < plate_lo - 1e-5 or upper[i] > plate_hi + 1e-5:
+                raise ValueError(f"{side} base or mounting plate is not fully supported")
+        gap = lower[2] - composition["mount_plate_top_z_m"]
+        if abs(gap) > 1e-4:
+            raise ValueError(f"{side} base is floating or intersecting its mounting plate: {gap:.6f} m")
+        report[side] = {"base_bounds_world_m": [list(lower), list(upper)], "minimum_table_edge_clearance_m": clearance, "mount_contact_gap_m": gap}
+    return report
+
+
+def _layout_orientation_xyzw(layout: dict[str, object]) -> tuple[float, ...]:
+    """Return Isaac Lab 3.0 root orientation, accepting legacy mislabeled packs."""
+    value = layout.get("base_orientation_world_xyzw")
+    if value is None:
+        value = layout.get("base_orientation_world_wxyz")
+    if not isinstance(value, list) or len(value) != 4:
+        raise ValueError("static Franka layout requires a four-value xyzw orientation")
+    orientation = tuple(float(component) for component in value)
+    norm = math.sqrt(sum(component * component for component in orientation))
+    if not all(math.isfinite(component) for component in orientation) or abs(norm - 1.0) > 1e-4:
+        raise ValueError("static Franka xyzw orientation must be a finite unit quaternion")
+    return orientation
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _load_static_link_pose(
+    path: Path, robot_layout: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """Load and validate a recorded visual-only link-pose artifact."""
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if payload.get("format") != "robot_data_static_link_pose":
+        raise ValueError("unexpected static link pose format")
+    link_names = payload.get("link_names")
+    if not isinstance(link_names, list) or not link_names or len(set(link_names)) != len(link_names):
+        raise ValueError("static link pose requires unique link names")
+    robots = payload.get("robots")
+    if not isinstance(robots, dict) or set(robots) != {"left", "right"}:
+        raise ValueError("static link pose requires left and right robots")
+    for side, robot in robots.items():
+        source_base = robot.get("source_base_position_world_m")
+        poses = robot.get("link_poses_world_xyzw")
+        if not isinstance(source_base, list) or len(source_base) != 3:
+            raise ValueError(f"{side} static link pose requires a source base position")
+        if not isinstance(poses, list) or len(poses) != len(link_names):
+            raise ValueError(f"{side} static link pose count does not match link names")
+        for pose in poses:
+            if not isinstance(pose, list) or len(pose) != 7:
+                raise ValueError(f"{side} static link pose must contain xyz plus xyzw")
+            values = [float(value) for value in pose]
+            if not all(math.isfinite(value) for value in values):
+                raise ValueError(f"{side} static link pose must be finite")
+            quat_norm = math.sqrt(sum(value * value for value in values[3:]))
+            if abs(quat_norm - 1.0) > 1e-4:
+                raise ValueError(f"{side} static link pose quaternion must be normalized")
+        if robot_layout is not None:
+            if "panda_link0" not in link_names:
+                raise ValueError("static pose requires panda_link0 for base orientation validation")
+            actual = poses[link_names.index("panda_link0")][3:]
+            expected = _layout_orientation_xyzw(robot_layout[side])
+            error = min(max(abs(a - b) for a, b in zip(actual, expected)),
+                        max(abs(a + b) for a, b in zip(actual, expected)))
+            if error > 1e-4:
+                raise ValueError(f"{side} recorded base orientation differs from planned layout")
+    return payload
+
+
+def _load_workstation_visual_asset(
+    workstation_usd: Path,
+    manifest_file: Path,
+    hdri_file: Path,
+) -> dict[str, Any]:
+    """Validate the portable scene pack and return provenance-safe metadata."""
+    paths = {
+        "workstation_usd": workstation_usd.expanduser().resolve(),
+        "manifest": manifest_file.expanduser().resolve(),
+        "hdri": hdri_file.expanduser().resolve(),
+    }
+    missing = [name for name, path in paths.items() if not path.is_file()]
+    if missing:
+        raise ValueError("missing workstation visual asset: " + ", ".join(missing))
+    manifest = json.loads(paths["manifest"].read_text(encoding="utf-8"))
+    if manifest.get("format") != "robot_data_visual_asset_pack":
+        raise ValueError("unexpected workstation asset manifest format")
+    manifest_id = manifest.get("id")
+    if manifest_id not in {
+        "household_workstation_v1",
+        "bimanual_tabletop_v1",
+        "bimanual_tabletop_v2",
+        "bimanual_tabletop_v3",
+        "bimanual_tabletop_v4",
+        "bimanual_tabletop_v5",
+        "bimanual_tabletop_v6",
+        "bimanual_tabletop_v7",
+        "bimanual_tabletop_v8",
+        "bimanual_tabletop_v9",
+        "bimanual_tabletop_v10",
+        "bimanual_tabletop_v11",
+        "bimanual_tabletop_v12",
+        "bimanual_tabletop_v13",
+        "bimanual_tabletop_v14",
+        "bimanual_tabletop_v15",
+        "bimanual_tabletop_v16",
+        "bimanual_tabletop_v17",
+    }:
+        raise ValueError("unexpected workstation asset manifest id")
+    if paths["workstation_usd"].parent != paths["manifest"].parent:
+        raise ValueError("workstation USD and manifest must share one asset-pack directory")
+    expected_hdri = manifest.get("hdri", {}).get("sha256")
+    actual_hdri = _sha256_file(paths["hdri"])
+    if expected_hdri != actual_hdri:
+        raise ValueError("workstation HDRI hash does not match the asset manifest")
+    table_top_z_m = float(manifest.get("composition", {}).get("table_top_z_m"))
+    if manifest_id.startswith("bimanual_tabletop_"):
+        _bimanual_tabletop_geometry(table_top_z_m, manifest["composition"] if "table_size_m" in manifest["composition"] else None)
+    else:
+        _workstation_cube_lift_geometry(table_top_z_m)
+    registry = manifest.get("registry", {})
+    result = {
+        "asset_id": registry.get("asset_id", "SCN-household-workstation"),
+        "asset_version": int(registry.get("asset_version", 1)),
+        "manifest_id": manifest["id"],
+        "manifest_file": str(paths["manifest"]),
+        "manifest_sha256": _sha256_file(paths["manifest"]),
+        "workstation_usd": str(paths["workstation_usd"]),
+        "workstation_usd_sha256": _sha256_file(paths["workstation_usd"]),
+        "hdri_file": str(paths["hdri"]),
+        "hdri_sha256": actual_hdri,
+        "hdri_license": manifest["hdri"].get("license"),
+        "source": manifest.get("source", {}),
+        "composition": manifest["composition"],
+        "limitations": manifest.get("limitations", []),
+    }
+    recorded_pose = manifest.get("composition", {}).get("recorded_visual_pose")
+    if recorded_pose is not None:
+        pose_path = paths["manifest"].parent / recorded_pose["path"]
+        if not pose_path.is_file():
+            raise ValueError("missing recorded visual pose artifact")
+        pose_sha256 = _sha256_file(pose_path)
+        if pose_sha256 != recorded_pose.get("sha256"):
+            raise ValueError("recorded visual pose hash does not match the asset manifest")
+        pose_payload = json.loads(pose_path.read_text(encoding="utf-8"))
+        if pose_payload.get("format") != "robot_data_static_link_pose":
+            raise ValueError("unexpected recorded visual pose format")
+        if manifest_id == "bimanual_tabletop_v17":
+            _load_static_link_pose(pose_path, manifest["composition"]["robot_layout"])
+        result["recorded_visual_pose_file"] = str(pose_path)
+        result["recorded_visual_pose_sha256"] = pose_sha256
+    return result
+
+
+def _apply_renderer_kit_settings(settings: object, profile: dict[str, Any]) -> dict[str, Any]:
+    """Apply typed renderer overrides after Kit starts and return exact readback."""
+    requested = profile.get("kit_settings", {})
+    for key, value in requested.items():
+        settings.set(key, value)
+    observed = {key: settings.get(key) for key in requested}
+    mismatches = {
+        key: {"requested": value, "observed": observed[key]}
+        for key, value in requested.items()
+        if observed[key] != value
+    }
+    if mismatches:
+        raise RuntimeError("renderer Kit setting readback mismatch: " + repr(mismatches))
+    return observed
+
+
+def _visual_demo_joint_targets(
+    initial_joint_positions: tuple[float, ...],
+    *,
+    control_step: int,
+    total_control_steps: int,
+) -> tuple[float, ...]:
+    """Return a smooth, deterministic camera-demo motion that ends at home."""
+    if len(initial_joint_positions) != 7:
+        raise ValueError("visual demo requires seven Franka arm joints")
+    if total_control_steps < 2:
+        raise ValueError("visual demo requires at least two control steps")
+    if not 0 <= control_step < total_control_steps:
+        raise ValueError("visual demo control step is out of range")
+    phase = control_step / (total_control_steps - 1)
+    envelope = math.sin(math.pi * phase)
+    targets = list(initial_joint_positions)
+    targets[0] += 0.28 * envelope * math.sin(2.0 * math.pi * phase)
+    targets[1] += 0.10 * envelope * math.sin(math.pi * phase)
+    targets[3] += 0.12 * envelope * math.sin(2.0 * math.pi * phase + math.pi / 3.0)
+    targets[5] += 0.16 * envelope * math.sin(2.0 * math.pi * phase + math.pi / 2.0)
+    return tuple(targets)
+
+
+def _git_state(repo_root: Path) -> dict[str, object]:
+    """Return best-effort code provenance without making the demo depend on Git."""
+    try:
+        revision = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        dirty = bool(
+            subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=repo_root,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return {"repository": str(repo_root), "git_revision": None, "git_dirty": None}
+    return {"repository": str(repo_root), "git_revision": revision, "git_dirty": dirty}
+
+
+def _visual_demo_provenance(
+    args: argparse.Namespace,
+    *,
+    frame_count: int,
+    videos: dict[str, str],
+) -> dict[str, object]:
+    """Build the inspectable manifest written beside visual-demo videos."""
+    limitations = ["This is a visual prototype, not a claim of RoboDojo parity."]
+    if args.visual_style == "dual_franka_tabletop":
+        limitations.append(
+            "This static presentation disables robot, table, and cube collision response; it is not a physics or task-success evaluation."
+        )
+    else:
+        limitations.append(
+            "Robot and task physics are unchanged except for aligning the hidden table collision proxy to the visual tabletop."
+        )
+    if args.visual_style in {"usd_workstation", "dual_franka_tabletop"}:
+        limitations.extend(args.visual_asset.get("limitations", []))
+        if args.visual_style == "usd_workstation":
+            limitations.append(
+                "The D435i imaging profile is nominal and pending real photometric calibration."
+            )
+    else:
+        limitations.append(
+            "The PBR studio uses procedural geometry and PreviewSurface materials, not RoboDojo assets."
+        )
+    elapsed = getattr(args, "visual_demo_elapsed_seconds", None)
+    return {
+        "format": "robot_data_visual_demo",
+        "format_version": 1,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "purpose": "renderer_and_scene_visual_comparison_only",
+        "scene_id": args.scene,
+        "visual_style": args.visual_style,
+        "renderer_profile": args.renderer_profile,
+        "renderer_settings_readback": getattr(
+            args, "renderer_settings_readback", {}
+        ),
+        "camera_profile": _camera_profile_metadata(args.camera_profile),
+        "visual_asset": getattr(args, "visual_asset", None),
+        "camera_names": list(getattr(args, "visual_camera_names", CAMERA_NAMES)),
+        "robot_layout": getattr(args, "visual_robot_layout", None),
+        "mount_validation": getattr(args, "visual_mount_validation", None),
+        "width": args.width,
+        "height": args.height,
+        "fps": int(round(args.dataset_fps)),
+        "frame_count": frame_count,
+        "duration_seconds": frame_count / args.dataset_fps,
+        "render_elapsed_seconds": elapsed,
+        "average_output_fps": (
+            frame_count / elapsed if elapsed is not None and elapsed > 0 else None
+        ),
+        "physics_hz": args.physics_hz,
+        "control_hz": args.control_hz,
+        "seed": args.seed,
+        "videos": videos,
+        "command": [sys.executable, "-m", "gello_remote.isaaclab_gello", *sys.argv[1:]],
+        "code": _git_state(Path(__file__).resolve().parents[2]),
+        "limitations": limitations,
+    }
+
+
+def _write_visual_demo_frame(
+    output_dir: Path,
+    images: dict[str, object],
+    *,
+    frame_index: int,
+    camera_names: tuple[str, ...] = CAMERA_NAMES,
+) -> None:
+    """Write one synchronized four-camera sample for later ffmpeg encoding."""
+    import cv2
+
+    for camera_name in camera_names:
+        image = images[camera_name]
+        bgr = cv2.cvtColor(image[..., :3], cv2.COLOR_RGB2BGR)
+        camera_dir = output_dir / f"{camera_name}_rgb"
+        camera_dir.mkdir(parents=True, exist_ok=True)
+        destination = camera_dir / f"{frame_index:06d}.jpg"
+        if not cv2.imwrite(str(destination), bgr, [cv2.IMWRITE_JPEG_QUALITY, 95]):
+            raise RuntimeError(f"OpenCV failed to write visual-demo frame: {destination}")
+
+
 def _rigid_pick_place_geometry(work_surface_height_m: float) -> dict[str, object]:
     """Return the engine-independent P0 rigid-task geometry in Franka-base coordinates."""
     surface_z = _validate_work_surface_height(work_surface_height_m)
@@ -536,15 +960,18 @@ def _evaluation_position_split(evaluation_plan: Any | None) -> str:
 
 
 def _scene_camera_overrides(
-    profile: dict[str, Any], *, work_surface_top_m: float | None
+    profile: dict[str, Any], *, work_surface_top_m: float | None,
+    task_center_xy: tuple[float, float] = (0.45, 0.0),
+    preserve_authored_targets: bool = False,
 ) -> dict[str, dict[str, Any]]:
     """Resolve camera targets without mutating the reusable hardware profile."""
     overrides = json.loads(json.dumps(profile["engine_overrides"]["isaac_sim"]))
-    if work_surface_top_m is None:
+    if work_surface_top_m is None or preserve_authored_targets:
         return overrides
-    overrides["base"]["target_world_m"] = [0.45, 0.0, work_surface_top_m + 0.15]
-    overrides["top"]["target_world_m"] = [0.45, 0.0, work_surface_top_m]
-    overrides["side"]["target_world_m"] = [0.45, 0.0, work_surface_top_m + 0.14]
+    target_x, target_y = task_center_xy
+    overrides["base"]["target_world_m"] = [target_x, target_y, work_surface_top_m + 0.15]
+    overrides["top"]["target_world_m"] = [target_x, target_y, work_surface_top_m]
+    overrides["side"]["target_world_m"] = [target_x, target_y, work_surface_top_m + 0.14]
     return overrides
 
 
@@ -579,6 +1006,34 @@ def _load_camera_profile(path: Path | None, *, width: int, height: int) -> dict[
         )
     value["profile_source"] = source
     return value
+
+
+def _load_renderer_profile(path: Path | None) -> dict[str, Any]:
+    """Load renderer selection before AppLauncher starts Kit."""
+    if path is None:
+        profile = RendererProfileV1.model_validate(DEFAULT_RENDERER_PROFILE)
+        value = renderer_profile_metadata(profile)
+        value["profile_source"] = "builtin"
+        return value
+    resolved = path.expanduser().resolve()
+    profile = load_renderer_profile(resolved)
+    return renderer_profile_metadata(profile, source=resolved)
+
+
+def _renderer_profile_kit_args(profile: dict[str, Any]) -> list[str]:
+    """Serialize renderer settings for Kit startup as well as runtime readback."""
+    values: list[str] = []
+    for key, value in profile.get("kit_settings", {}).items():
+        if isinstance(value, bool):
+            serialized = "true" if value else "false"
+        elif isinstance(value, (int, float, str)):
+            serialized = str(value)
+        else:
+            raise ValueError(f"unsupported renderer Kit setting value: {key}")
+        if any(character.isspace() for character in serialized):
+            raise ValueError(f"renderer Kit setting cannot contain whitespace: {key}")
+        values.append(f"--{key}={serialized}")
+    return values
 
 
 def _camera_intrinsic_matrix(
@@ -630,6 +1085,7 @@ def _camera_profile_metadata(profile: dict[str, Any]) -> dict[str, Any]:
                 ),
                 "intrinsics": profile["roles"][name].get("intrinsics"),
                 "distortion": profile["roles"][name].get("distortion"),
+                "imaging": profile["roles"][name].get("imaging"),
             }
             for name in ("agentview", "wrist")
         },
@@ -637,6 +1093,9 @@ def _camera_profile_metadata(profile: dict[str, Any]) -> dict[str, Any]:
             name: profile["engine_overrides"]["isaac_sim"][name]
             for name in ("top", "side")
         },
+        "engine_imaging": profile["engine_overrides"]["isaac_sim"].get(
+            "imaging"
+        ),
     }
 
 
@@ -1426,6 +1885,11 @@ def _parse_args() -> tuple[argparse.Namespace, object]:
         help="Robot Data Studio camera-profile JSON; defaults to nominal D435i geometry",
     )
     parser.add_argument(
+        "--renderer-profile-file",
+        type=Path,
+        help="Robot Data Studio renderer-profile JSON; must match --rendering_mode",
+    )
+    parser.add_argument(
         "--gpu-id",
         type=int,
         default=0,
@@ -1470,6 +1934,32 @@ def _parse_args() -> tuple[argparse.Namespace, object]:
         default=0,
         help="run bounded internal-command physics steps without opening the WebSocket server",
     )
+    parser.add_argument(
+        "--visual-demo-output",
+        type=Path,
+        help="record a bounded four-camera smoke run and encode inspectable MP4 files",
+    )
+    parser.add_argument(
+        "--visual-style",
+        choices=VISUAL_STYLES,
+        default="baseline",
+        help="keep the canonical scene or load a versioned single/dual-arm visual workstation",
+    )
+    parser.add_argument(
+        "--workstation-usd",
+        type=Path,
+        help="portable workstation USD entrypoint; required for either USD visual style",
+    )
+    parser.add_argument(
+        "--workstation-manifest-file",
+        type=Path,
+        help="visual asset-pack manifest; required for either USD visual style",
+    )
+    parser.add_argument(
+        "--hdri-file",
+        type=Path,
+        help="versioned HDRI file; required for either USD visual style",
+    )
     AppLauncher.add_app_launcher_args(parser)
     args = parser.parse_args()
     try:
@@ -1493,6 +1983,73 @@ def _parse_args() -> tuple[argparse.Namespace, object]:
         parser.error("physics, control, speed, and timeout values must be positive")
     if args.smoke_steps < 0:
         parser.error("smoke_steps must be non-negative")
+    if args.visual_demo_output is not None:
+        if args.smoke_steps <= 0:
+            parser.error("--visual-demo-output requires a positive --smoke_steps")
+        if args.control_source != "gello":
+            parser.error("visual demo currently requires --control-source gello")
+        if args.scene != "rigid_cube_lift":
+            parser.error("visual demo currently requires --scene rigid_cube_lift")
+        if not args.enable_cameras:
+            parser.error("visual demo requires --enable_cameras")
+        args.visual_demo_output = args.visual_demo_output.expanduser().resolve()
+        if args.visual_demo_output.exists() and any(args.visual_demo_output.iterdir()):
+            parser.error("visual demo output directory must be absent or empty")
+    elif args.visual_style != "baseline":
+        parser.error("--visual-style requires --visual-demo-output")
+    args.visual_asset = None
+    workstation_paths = (
+        args.workstation_usd,
+        args.workstation_manifest_file,
+        args.hdri_file,
+    )
+    usd_visual_styles = {"usd_workstation", "dual_franka_tabletop"}
+    if args.visual_style in usd_visual_styles:
+        if any(path is None for path in workstation_paths):
+            parser.error(
+                f"{args.visual_style} requires --workstation-usd, "
+                "--workstation-manifest-file, and --hdri-file"
+            )
+        try:
+            args.visual_asset = _load_workstation_visual_asset(
+                args.workstation_usd,
+                args.workstation_manifest_file,
+                args.hdri_file,
+            )
+        except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            parser.error(str(exc))
+        args.workstation_usd = Path(args.visual_asset["workstation_usd"])
+        args.workstation_manifest_file = Path(args.visual_asset["manifest_file"])
+        args.hdri_file = Path(args.visual_asset["hdri_file"])
+        expected_manifests = {
+            "usd_workstation": {"household_workstation_v1"},
+            "dual_franka_tabletop": {
+                "bimanual_tabletop_v1",
+                "bimanual_tabletop_v2",
+                "bimanual_tabletop_v3",
+                "bimanual_tabletop_v4",
+                "bimanual_tabletop_v5",
+                "bimanual_tabletop_v6",
+                "bimanual_tabletop_v7",
+                "bimanual_tabletop_v8",
+                "bimanual_tabletop_v9",
+                "bimanual_tabletop_v10",
+                "bimanual_tabletop_v11",
+                "bimanual_tabletop_v12",
+                "bimanual_tabletop_v13",
+                "bimanual_tabletop_v14",
+                "bimanual_tabletop_v15",
+                "bimanual_tabletop_v16",
+                "bimanual_tabletop_v17",
+            },
+        }[args.visual_style]
+        if args.visual_asset["manifest_id"] not in expected_manifests:
+            parser.error(
+                f"{args.visual_style} requires one of manifest ids "
+                f"{sorted(expected_manifests)!r}"
+            )
+    elif any(path is not None for path in workstation_paths):
+        parser.error("workstation asset options require a USD workstation visual style")
     if min(
         args.inference_steps,
         args.replan_steps,
@@ -1551,6 +2108,19 @@ def _parse_args() -> tuple[argparse.Namespace, object]:
         )
     except (OSError, json.JSONDecodeError, ValueError) as exc:
         parser.error(str(exc))
+    try:
+        args.renderer_profile = _load_renderer_profile(args.renderer_profile_file)
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        parser.error(str(exc))
+    if args.rendering_mode != args.renderer_profile["rendering_mode"]:
+        parser.error(
+            "--rendering_mode does not match renderer profile: "
+            f"{args.rendering_mode!r} != {args.renderer_profile['rendering_mode']!r}"
+        )
+    profile_kit_args = _renderer_profile_kit_args(args.renderer_profile)
+    args.kit_args = " ".join(
+        [part for part in (getattr(args, "kit_args", "").strip(), *profile_kit_args) if part]
+    )
     if args.dataset_fps is None:
         args.dataset_fps = float(args.camera_profile.get("dataset_fps_default", 10.0))
     if not math.isclose(args.dataset_fps, round(args.dataset_fps), rel_tol=0.0, abs_tol=1e-9):
@@ -1580,6 +2150,7 @@ def _parse_args() -> tuple[argparse.Namespace, object]:
 def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
     import importlib.metadata
 
+    import carb
     import numpy as np
     import torch
     import isaaclab.sim as sim_utils
@@ -1588,16 +2159,137 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
     from isaaclab.utils.math import subtract_frame_transforms
     from isaaclab_assets import FRANKA_PANDA_HIGH_PD_CFG
 
+    visual_demo_started_at = (
+        time.perf_counter() if args.visual_demo_output is not None else None
+    )
+    args.renderer_settings_readback = _apply_renderer_kit_settings(
+        carb.settings.get_settings(), args.renderer_profile
+    )
     sim_dt = 1.0 / args.physics_hz
     control_decimation = int(round(args.physics_hz / args.control_hz))
     stream_decimation = args.stream_physics_decimation
-    sim = sim_utils.SimulationContext(sim_utils.SimulationCfg(dt=sim_dt, device=args.device))
-    ground_cfg = sim_utils.GroundPlaneCfg()
-    ground_cfg.func("/World/defaultGroundPlane", ground_cfg)
-    light_cfg = sim_utils.DomeLightCfg(intensity=2500.0)
+    pbr_studio = (
+        args.visual_demo_output is not None and args.visual_style == "pbr_studio"
+    )
+    usd_workstation = (
+        args.visual_demo_output is not None
+        and args.visual_style == "usd_workstation"
+    )
+    dual_franka_tabletop = (
+        args.visual_demo_output is not None
+        and args.visual_style == "dual_franka_tabletop"
+    )
+    usd_visual = usd_workstation or dual_franka_tabletop
+    photoreal_visual = pbr_studio or usd_visual
+    args.visual_camera_names = (
+        BIMANUAL_VISUAL_CAMERA_NAMES if dual_franka_tabletop else CAMERA_NAMES
+    )
+    args.visual_robot_layout = (
+        json.loads(
+            json.dumps(args.visual_asset["composition"].get("robot_layout"))
+        )
+        if dual_franka_tabletop
+        else None
+    )
+    args.visual_link_pose = (
+        _load_static_link_pose(
+            Path(args.visual_asset["recorded_visual_pose_file"])
+        )
+        if dual_franka_tabletop
+        and args.visual_asset.get("recorded_visual_pose_file") is not None
+        else None
+    )
+    sim = sim_utils.SimulationContext(
+        sim_utils.SimulationCfg(
+            dt=sim_dt,
+            device=args.device,
+            # Offline path-traced inspection needs USD transforms to reflect the
+            # recorded static joint pose. Fabric remains enabled everywhere else.
+            use_fabric=not dual_franka_tabletop,
+        )
+    )
+    if dual_franka_tabletop:
+        ground_cfg = sim_utils.CuboidCfg(
+            size=(8.0, 8.0, 0.05),
+            collision_props=sim_utils.CollisionPropertiesCfg(),
+            visual_material=sim_utils.PreviewSurfaceCfg(
+                diffuse_color=(0.14, 0.16, 0.19),
+                roughness=0.72,
+                metallic=0.0,
+            ),
+        )
+        ground_cfg.func(
+            "/World/defaultGroundPlane", ground_cfg, translation=(0.0, 0.0, -0.025)
+        )
+    else:
+        ground_cfg = sim_utils.GroundPlaneCfg(
+            color=(0.075, 0.085, 0.10) if photoreal_visual else (0.0, 0.0, 0.0)
+        )
+        ground_cfg.func("/World/defaultGroundPlane", ground_cfg)
+    light_cfg = sim_utils.DomeLightCfg(
+        intensity=350.0 if usd_visual else (700.0 if pbr_studio else 2500.0),
+        color=(1.0, 1.0, 1.0) if usd_visual else (
+            (0.72, 0.80, 1.0) if pbr_studio else (1.0, 1.0, 1.0)
+        ),
+        texture_file=str(args.hdri_file) if usd_visual else None,
+        texture_format="latlong" if usd_visual else "automatic",
+        visible_in_primary_ray=(dual_franka_tabletop or not photoreal_visual),
+    )
     light_cfg.func("/World/Light", light_cfg)
+    if usd_visual:
+        workstation_cfg = sim_utils.UsdFileCfg(
+            usd_path=str(args.workstation_usd),
+        )
+        workstation_cfg.func(
+            "/World/Workstation",
+            workstation_cfg,
+        )
+    if pbr_studio:
+        key_light_cfg = sim_utils.SphereLightCfg(
+            intensity=18000.0,
+            radius=0.42,
+            normalize=True,
+            enable_color_temperature=True,
+            color_temperature=5200.0,
+        )
+        key_light_cfg.func(
+            "/World/StudioLights/Key",
+            key_light_cfg,
+            translation=(1.25, 1.10, 2.15),
+        )
+        fill_light_cfg = sim_utils.SphereLightCfg(
+            intensity=9500.0,
+            radius=0.35,
+            normalize=True,
+            color=(0.62, 0.74, 1.0),
+        )
+        fill_light_cfg.func(
+            "/World/StudioLights/Fill",
+            fill_light_cfg,
+            translation=(-0.35, -1.10, 1.55),
+        )
+        rim_light_cfg = sim_utils.SphereLightCfg(
+            intensity=12000.0,
+            radius=0.25,
+            normalize=True,
+            color=(1.0, 0.73, 0.52),
+        )
+        rim_light_cfg.func(
+            "/World/StudioLights/Rim",
+            rim_light_cfg,
+            translation=(-0.45, 0.35, 1.25),
+        )
 
-    if args.scene == "rigid_pick_place":
+    if dual_franka_tabletop:
+        scene_geometry = _bimanual_tabletop_geometry(
+            float(args.visual_asset["composition"]["table_top_z_m"]),
+            args.visual_asset["composition"],
+        )
+    elif usd_workstation:
+        scene_geometry = _workstation_cube_lift_geometry(
+            float(args.visual_asset["composition"]["table_top_z_m"])
+        )
+    elif args.scene == "rigid_pick_place":
         scene_geometry = _rigid_pick_place_geometry(args.work_surface_height_m)
     elif args.scene == "rigid_cube_lift":
         scene_geometry = _rigid_cube_lift_geometry(args.work_surface_height_m)
@@ -1614,21 +2306,85 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
         else STREAM_CAMERA_TARGET
     )
     task_object: object | None = None
+    if pbr_studio:
+        studio_panels = (
+            (
+                "BackWall",
+                (0.05, 3.20, 2.50),
+                (-0.82, 0.0, 1.25),
+                (0.12, 0.15, 0.20),
+                0.72,
+                0.05,
+            ),
+            (
+                "SideWall",
+                (3.20, 0.05, 2.50),
+                (0.58, -1.58, 1.25),
+                (0.16, 0.18, 0.22),
+                0.66,
+                0.02,
+            ),
+            (
+                "BackAccent",
+                (0.03, 1.55, 0.58),
+                (-0.785, 0.12, 1.08),
+                (0.035, 0.22, 0.31),
+                0.34,
+                0.18,
+            ),
+        )
+        for name, size, translation, color, roughness, metallic in studio_panels:
+            panel_cfg = sim_utils.CuboidCfg(
+                size=size,
+                visual_material=sim_utils.PreviewSurfaceCfg(
+                    diffuse_color=color,
+                    roughness=roughness,
+                    metallic=metallic,
+                ),
+            )
+            panel_cfg.func(
+                f"/World/Studio/{name}",
+                panel_cfg,
+                translation=translation,
+            )
     if scene_geometry is not None:
         work_surface_cfg = sim_utils.CuboidCfg(
             size=scene_geometry["work_surface_size_m"],
-            collision_props=sim_utils.CollisionPropertiesCfg(),
-            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.67, 0.54, 0.38)),
+            collision_props=(
+                None
+                if dual_franka_tabletop
+                else sim_utils.CollisionPropertiesCfg()
+            ),
+            visual_material=sim_utils.PreviewSurfaceCfg(
+                diffuse_color=(0.19, 0.22, 0.26) if photoreal_visual else (0.67, 0.54, 0.38),
+                roughness=0.24 if photoreal_visual else 0.5,
+                metallic=0.22 if pbr_studio else 0.0,
+                opacity=0.0 if usd_visual else 1.0,
+            ),
         )
         work_surface_cfg.func(
             "/World/WorkSurface",
             work_surface_cfg,
             translation=scene_geometry["work_surface_center_m"],
         )
+        if usd_visual:
+            import omni.usd
+            from pxr import UsdGeom
+
+            work_surface_prim = omni.usd.get_context().get_stage().GetPrimAtPath(
+                "/World/WorkSurface"
+            )
+            if not work_surface_prim.IsValid():
+                raise RuntimeError("hidden workstation collision proxy was not created")
+            UsdGeom.Imageable(work_surface_prim).MakeInvisible()
         if "target_size_m" in scene_geometry:
             target_cfg = sim_utils.CuboidCfg(
                 size=scene_geometry["target_size_m"],
-                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.20, 0.48, 0.92)),
+                visual_material=sim_utils.PreviewSurfaceCfg(
+                    diffuse_color=(0.16, 0.42, 0.90),
+                    roughness=0.32 if photoreal_visual else 0.5,
+                    metallic=0.10 if photoreal_visual else 0.0,
+                ),
             )
             target_cfg.func(
                 "/World/TargetZone",
@@ -1639,11 +2395,20 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
             prim_path="/World/TaskObject",
             spawn=sim_utils.CuboidCfg(
                 size=(scene_geometry["object_size_m"],) * 3,
-                rigid_props=sim_utils.RigidBodyPropertiesCfg(),
+                rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                    kinematic_enabled=dual_franka_tabletop,
+                    disable_gravity=dual_franka_tabletop,
+                ),
                 mass_props=sim_utils.MassPropertiesCfg(mass=0.035),
-                collision_props=sim_utils.CollisionPropertiesCfg(),
+                collision_props=(
+                    None
+                    if dual_franka_tabletop
+                    else sim_utils.CollisionPropertiesCfg()
+                ),
                 visual_material=sim_utils.PreviewSurfaceCfg(
-                    diffuse_color=(0.25, 0.86, 0.38)
+                    diffuse_color=(0.94, 0.24, 0.08) if photoreal_visual else (0.25, 0.86, 0.38),
+                    roughness=0.20 if photoreal_visual else 0.5,
+                    metallic=0.12 if photoreal_visual else 0.0,
                 ),
             ),
             init_state=RigidObjectCfg.InitialStateCfg(
@@ -1652,40 +2417,89 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
         )
         task_object = RigidObject(cfg=object_cfg)
 
-    robot_cfg = FRANKA_PANDA_HIGH_PD_CFG.replace(prim_path="/World/Franka")
-    if args.franka_usd:
-        robot_cfg.spawn.usd_path = args.franka_usd
-    for index, value in enumerate(FRANKA_HOME, start=1):
-        robot_cfg.init_state.joint_pos[f"panda_joint{index}"] = value
-    robot_cfg.init_state.joint_pos["panda_finger_joint.*"] = 0.04
-    robot = Articulation(cfg=robot_cfg)
+    def franka_cfg(prim_path: str, layout: dict[str, object] | None = None):
+        cfg = FRANKA_PANDA_HIGH_PD_CFG.replace(prim_path=prim_path)
+        if args.franka_usd:
+            cfg.spawn.usd_path = args.franka_usd
+        joint_positions = (
+            tuple(layout.get("joint_positions_rad", FRANKA_HOME))
+            if layout is not None
+            else FRANKA_HOME
+        )
+        if len(joint_positions) != 7:
+            raise ValueError("static Franka layout must provide seven joint positions")
+        for index, value in enumerate(joint_positions, start=1):
+            cfg.init_state.joint_pos[f"panda_joint{index}"] = value
+        cfg.init_state.joint_pos["panda_finger_joint.*"] = 0.04
+        if layout is not None:
+            cfg.init_state.pos = tuple(layout["base_position_world_m"])
+            cfg.init_state.rot = _layout_orientation_xyzw(layout)
+            cfg.spawn.collision_props = sim_utils.CollisionPropertiesCfg(
+                collision_enabled=False
+            )
+            cfg.spawn.articulation_props.enabled_self_collisions = False
+        return cfg
+
+    robot_layout = args.visual_robot_layout or {}
+    robot = Articulation(
+        cfg=franka_cfg(
+            "/World/Franka",
+            robot_layout.get("left") if dual_franka_tabletop else None,
+        )
+    )
+    robot_right = (
+        Articulation(
+            cfg=franka_cfg(
+                "/World/FrankaRight",
+                robot_layout["right"],
+            )
+        )
+        if dual_franka_tabletop
+        else None
+    )
     record_cameras: dict[str, object] = {}
     camera_prim_paths: dict[str, str] = {}
     camera_intrinsic_sources: dict[str, str] = {}
     camera_intrinsic_matrices: dict[str, list[float]] = {}
-    if args.smoke_steps == 0:
+    if args.smoke_steps == 0 or args.visual_demo_output is not None:
         from isaaclab.sensors import Camera, CameraCfg
 
         profile = args.camera_profile
         isaac_overrides = _scene_camera_overrides(
-            profile, work_surface_top_m=work_surface_top_m
+            profile,
+            work_surface_top_m=work_surface_top_m,
+            task_center_xy=(
+                (0.65, 0.0)
+                if dual_franka_tabletop
+                else ((0.55, -0.10) if usd_workstation else (0.45, 0.0))
+            ),
+            preserve_authored_targets=dual_franka_tabletop,
         )
         camera_sensor_fps = max(args.dataset_fps, args.preview_fps)
-        for camera_name, role_name, prim_path, offset in (
-            ("base", "agentview", "/World/RecordCamera", None),
-            ("top", "agentview", "/World/RecordCameraTop", None),
-            ("side", "agentview", "/World/RecordCameraSide", None),
-            (
-                "wrist",
-                "wrist",
-                isaac_overrides["wrist"]["prim_path"],
-                CameraCfg.OffsetCfg(
-                    pos=tuple(isaac_overrides["wrist"]["position_parent_m"]),
-                    rot=tuple(isaac_overrides["wrist"]["rotation_parent_xyzw"]),
-                    convention=isaac_overrides["wrist"].get("convention", "ros"),
+        if dual_franka_tabletop:
+            camera_specs = (
+                ("base", "agentview", "/World/RecordCamera", None),
+                ("top", "agentview", "/World/RecordCameraTop", None),
+                ("left", "agentview", "/World/RecordCameraLeft", None),
+                ("right", "agentview", "/World/RecordCameraRight", None),
+            )
+        else:
+            camera_specs = (
+                ("base", "agentview", "/World/RecordCamera", None),
+                ("top", "agentview", "/World/RecordCameraTop", None),
+                ("side", "agentview", "/World/RecordCameraSide", None),
+                (
+                    "wrist",
+                    "wrist",
+                    isaac_overrides["wrist"]["prim_path"],
+                    CameraCfg.OffsetCfg(
+                        pos=tuple(isaac_overrides["wrist"]["position_parent_m"]),
+                        rot=tuple(isaac_overrides["wrist"]["rotation_parent_xyzw"]),
+                        convention=isaac_overrides["wrist"].get("convention", "ros"),
+                    ),
                 ),
-            ),
-        ):
+            )
+        for camera_name, role_name, prim_path, offset in camera_specs:
             matrix, intrinsic_source = _camera_intrinsic_matrix(
                 profile["roles"][role_name],
                 width=args.width,
@@ -1721,10 +2535,61 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
     def reset_task_assets(
         object_start_position_m: tuple[float, float, float] | None = None,
     ) -> None:
-        robot.write_joint_position_to_sim_index(position=robot.data.default_joint_pos.torch)
-        robot.write_joint_velocity_to_sim_index(velocity=robot.data.default_joint_vel.torch)
-        robot.reset()
+        if dual_franka_tabletop:
+            robot.reset()
+            assert robot_right is not None
+            robot_right.reset()
+            for side, robot_asset in (
+                ("left", robot),
+                ("right", robot_right),
+            ):
+                assert robot_asset is not None
+                planned = robot_layout[side]
+                root_pose = robot_asset.data.default_root_pose.torch.clone()
+                root_pose[:, :3] = torch.tensor(
+                    [planned["base_position_world_m"]],
+                    dtype=torch.float32,
+                    device=sim.device,
+                )
+                root_pose[:, 3:7] = torch.tensor(
+                    [_layout_orientation_xyzw(planned)],
+                    dtype=torch.float32,
+                    device=sim.device,
+                )
+                robot_asset.write_root_pose_to_sim_index(root_pose=root_pose)
+        if dual_franka_tabletop:
+            for side, robot_asset in (("left", robot), ("right", robot_right)):
+                assert robot_asset is not None
+                arm_ids = robot_asset.find_joints(
+                    [f"panda_joint{index}" for index in range(1, 8)],
+                    preserve_order=True,
+                )[0]
+                joint_positions = robot_asset.data.default_joint_pos.torch.clone()
+                joint_positions[:, arm_ids] = torch.tensor(
+                    [robot_layout[side]["joint_positions_rad"]],
+                    dtype=torch.float32,
+                    device=sim.device,
+                )
+                robot_asset.write_joint_position_to_sim_index(
+                    position=joint_positions
+                )
+                robot_asset.write_joint_velocity_to_sim_index(
+                    velocity=robot_asset.data.default_joint_vel.torch
+                )
+                robot_asset.set_joint_position_target_index(target=joint_positions)
+                robot_asset.write_data_to_sim()
+        else:
+            robot.write_joint_position_to_sim_index(
+                position=robot.data.default_joint_pos.torch
+            )
+            robot.write_joint_velocity_to_sim_index(
+                velocity=robot.data.default_joint_vel.torch
+            )
+        if not dual_franka_tabletop:
+            robot.reset()
         robot.update(sim_dt)
+        if robot_right is not None:
+            robot_right.update(sim_dt)
         if task_object is not None:
             root_state = task_object.data.default_root_state.torch.clone()
             if object_start_position_m is not None:
@@ -1736,9 +2601,151 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
             task_object.reset()
             task_object.update(sim_dt)
 
+    visual_link_pose_ops: dict[tuple[str, str], object] = {}
+
+    def apply_recorded_visual_pose() -> None:
+        """Replay recorded world link transforms for the static visual capture."""
+        if args.visual_link_pose is None:
+            return
+        import omni.usd
+        from pxr import Gf, UsdGeom
+
+        stage = omni.usd.get_context().get_stage()
+        link_names = args.visual_link_pose["link_names"]
+        for side in ("left", "right"):
+            robot_pose = args.visual_link_pose["robots"][side]
+            planned = robot_layout[side]
+            delta = [
+                float(target) - float(source)
+                for target, source in zip(
+                    planned["base_position_world_m"],
+                    robot_pose["source_base_position_world_m"],
+                )
+            ]
+            for link_name, pose in zip(
+                link_names, robot_pose["link_poses_world_xyzw"]
+            ):
+                key = (side, link_name)
+                operation = visual_link_pose_ops.get(key)
+                if operation is None:
+                    prim_path = f"{planned['prim_path']}/{link_name}"
+                    prim = stage.GetPrimAtPath(prim_path)
+                    if not prim.IsValid():
+                        raise RuntimeError(
+                            f"recorded visual pose link is missing: {prim_path}"
+                        )
+                    xformable = UsdGeom.Xformable(prim)
+                    xformable.ClearXformOpOrder()
+                    xformable.SetResetXformStack(True)
+                    operation = xformable.AddTransformOp(opSuffix="recordedVisualPose")
+                    visual_link_pose_ops[key] = operation
+                matrix = Gf.Matrix4d(1.0)
+                matrix.SetRotate(
+                    Gf.Quatd(
+                        float(pose[6]),
+                        Gf.Vec3d(*[float(value) for value in pose[3:6]]),
+                    )
+                )
+                matrix.SetTranslateOnly(
+                    Gf.Vec3d(
+                        float(pose[0]) + delta[0],
+                        float(pose[1]) + delta[1],
+                        float(pose[2]) + delta[2],
+                    )
+                )
+                operation.Set(matrix)
+
     reset_task_assets()
+    apply_recorded_visual_pose()
+    if dual_franka_tabletop and args.visual_asset["manifest_id"] in {"bimanual_tabletop_v16", "bimanual_tabletop_v17"}:
+        import omni.usd
+        from pxr import Usd, UsdGeom
+
+        stage = omni.usd.get_context().get_stage()
+        cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), [UsdGeom.Tokens.default_, UsdGeom.Tokens.render])
+        def mesh_bounds(path):
+            prim = stage.GetPrimAtPath(path)
+            if not prim.IsValid():
+                raise RuntimeError(f"mount validation prim missing: {path}")
+            bounds = cache.ComputeWorldBound(prim).ComputeAlignedRange()
+            return list(bounds.GetMin()), list(bounds.GetMax())
+        args.visual_mount_validation = _validate_bimanual_mount_bounds(
+            args.visual_asset["composition"],
+            mesh_bounds(args.visual_asset["composition"]["table_prim_path"]),
+            {side: mesh_bounds(robot_layout[side]["prim_path"] + "/panda_link0") for side in ("left", "right")},
+        )
+        print("BIMANUAL_MOUNT_VALIDATED " + json.dumps(args.visual_mount_validation), flush=True)
+    if dual_franka_tabletop:
+        for side, robot_asset in (("left", robot), ("right", robot_right)):
+            assert robot_asset is not None
+            actual_pose = (
+                robot_asset.data.root_pose_w.torch[0].detach().cpu().tolist()
+            )
+            planned = robot_layout[side]
+            position_error_m = max(
+                abs(actual - expected)
+                for actual, expected in zip(
+                    actual_pose[:3], planned["base_position_world_m"]
+                )
+            )
+            if position_error_m > 1e-4:
+                raise RuntimeError(
+                    f"{side} Franka root position mismatch: "
+                    f"planned={planned['base_position_world_m']!r}, "
+                    f"actual={actual_pose[:3]!r}"
+                )
+            if args.visual_asset["manifest_id"] == "bimanual_tabletop_v17":
+                expected_orientation = _layout_orientation_xyzw(planned)
+                orientation_error = min(
+                    max(abs(a - b) for a, b in zip(actual_pose[3:], expected_orientation)),
+                    max(abs(a + b) for a, b in zip(actual_pose[3:], expected_orientation)),
+                )
+                if orientation_error > 1e-4:
+                    raise RuntimeError(f"{side} actual base orientation differs from planned layout")
+            args.visual_robot_layout[side]["actual_root_pose_world_xyzw"] = [
+                float(value) for value in actual_pose
+            ]
+            arm_ids = robot_asset.find_joints(
+                [f"panda_joint{index}" for index in range(1, 8)],
+                preserve_order=True,
+            )[0]
+            actual_joints = (
+                robot_asset.data.joint_pos.torch[0, arm_ids]
+                .detach()
+                .cpu()
+                .tolist()
+            )
+            joint_error_rad = max(
+                abs(actual - expected)
+                for actual, expected in zip(
+                    actual_joints, planned["joint_positions_rad"]
+                )
+            )
+            if joint_error_rad > 1e-4:
+                raise RuntimeError(
+                    f"{side} Franka joint-position mismatch: "
+                    f"planned={planned['joint_positions_rad']!r}, "
+                    f"actual={actual_joints!r}"
+                )
+            args.visual_robot_layout[side]["actual_joint_positions_rad"] = [
+                float(value) for value in actual_joints
+            ]
+            hand_index = robot_asset.find_bodies("panda_hand")[0][0]
+            args.visual_robot_layout[side]["actual_hand_position_world_m"] = [
+                float(value)
+                for value in (
+                    robot_asset.data.body_pos_w.torch[0, hand_index]
+                    .detach()
+                    .cpu()
+                    .tolist()
+                )
+            ]
     if record_cameras:
-        for camera_name in ("base", "top", "side"):
+        for camera_name in (
+            BIMANUAL_VISUAL_CAMERA_NAMES[:]
+            if dual_franka_tabletop
+            else ("base", "top", "side")
+        ):
             camera_override = isaac_overrides[camera_name]
             record_cameras[camera_name].set_world_poses_from_view(
                 torch.tensor(
@@ -1973,6 +2980,9 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
             "stream_fps": args.stream_fps,
             "franka_usd": args.franka_usd,
             "camera_profile": _camera_profile_metadata(args.camera_profile),
+            "renderer_profile": args.renderer_profile,
+            "renderer_settings_readback": args.renderer_settings_readback,
+            "visual_asset": args.visual_asset,
             "camera_intrinsic_sources": camera_intrinsic_sources,
             "camera_intrinsic_matrices": camera_intrinsic_matrices,
             "camera_extrinsics": isaac_overrides,
@@ -2923,6 +3933,10 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
     )
     physics_step = 0
     control_step = 0
+    visual_frame_count = 0
+    visual_total_control_steps = max(
+        2, int(math.ceil(args.smoke_steps / control_decimation))
+    )
     control_tick_ms: deque[float] = deque(maxlen=max(20, int(round(args.control_hz * 5))))
     control_tick_times: deque[float] = deque(maxlen=max(20, int(round(args.control_hz * 5))))
     safe_command = controller.tick(now=0.0) if args.smoke_steps else controller.tick()
@@ -3048,7 +4062,32 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                     else:
                         views.activate(view_name, camera_path)
                         telemetry.update(viewport_camera=camera_path, view_error=None)
-                if args.smoke_steps and control_step == 0:
+                if args.visual_demo_output is not None:
+                    if dual_franka_tabletop:
+                        demo_targets = initial_joint_positions
+                        demo_gripper_closed = False
+                    else:
+                        demo_targets = _visual_demo_joint_targets(
+                            initial_joint_positions,
+                            control_step=min(
+                                control_step, visual_total_control_steps - 1
+                            ),
+                            total_control_steps=visual_total_control_steps,
+                        )
+                        demo_phase = min(
+                            control_step / (visual_total_control_steps - 1), 1.0
+                        )
+                        demo_gripper_closed = 0.36 <= demo_phase <= 0.68
+                    controller.submit(
+                        GelloCommand(
+                            sequence=control_step,
+                            timestamp_ns=control_step + 1,
+                            joint_targets=demo_targets,
+                            gripper_closed=demo_gripper_closed,
+                        ),
+                        received_at=simulated_time,
+                    )
+                elif args.smoke_steps and control_step == 0:
                     if args.control_source == "keyboard":
                         keyboard.submit(
                             {
@@ -3112,13 +4151,20 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                     and control_step % args.dataset_control_decimation == 0
                 )
                 preview_due = (
-                    bool(record_cameras)
+                    args.smoke_steps == 0
+                    and bool(record_cameras)
                     and control_step % args.preview_control_decimation == 0
+                )
+                visual_demo_due = (
+                    args.visual_demo_output is not None
+                    and control_step % args.dataset_control_decimation == 0
                 )
                 images = None
                 capture_timestamp_ns = None
-                if dataset_due or preview_due:
+                if dataset_due or preview_due or visual_demo_due:
                     assert record_cameras
+                    if visual_demo_due:
+                        apply_recorded_visual_pose()
                     for camera in record_cameras.values():
                         camera.update(dt=sim_dt)
                     images = {
@@ -3132,6 +4178,15 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                         frame_index=control_step,
                         captured_at_ns=time.monotonic_ns(),
                     )
+                if visual_demo_due:
+                    assert args.visual_demo_output is not None and images is not None
+                    _write_visual_demo_frame(
+                        args.visual_demo_output,
+                        images,
+                        frame_index=visual_frame_count,
+                        camera_names=args.visual_camera_names,
+                    )
+                    visual_frame_count += 1
                 if dataset_due:
                     assert writer is not None and images is not None
                     arm_positions = backend.current_joint_positions()
@@ -3237,6 +4292,8 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
 
             sim.step()
             robot.update(sim_dt)
+            if robot_right is not None:
+                robot_right.update(sim_dt)
             if task_object is not None:
                 task_object.update(sim_dt)
             if args.smoke_steps == 0 and physics_step % stream_decimation == 0:
@@ -3273,6 +4330,71 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
             writer.discard()
         if services_entered:
             services.__exit__(*sys.exc_info())
+
+    if args.visual_demo_output is not None:
+        from .openpi_policy import encode_videos
+
+        if dual_franka_tabletop:
+            for side, robot_asset in (("left", robot), ("right", robot_right)):
+                assert robot_asset is not None
+                arm_ids = robot_asset.find_joints(
+                    [f"panda_joint{index}" for index in range(1, 8)],
+                    preserve_order=True,
+                )[0]
+                args.visual_robot_layout[side]["final_joint_positions_rad"] = [
+                    float(value)
+                    for value in (
+                        robot_asset.data.joint_pos.torch[0, arm_ids]
+                        .detach()
+                        .cpu()
+                        .tolist()
+                    )
+                ]
+                hand_index = robot_asset.find_bodies("panda_hand")[0][0]
+                args.visual_robot_layout[side]["final_hand_position_world_m"] = [
+                    float(value)
+                    for value in (
+                        robot_asset.data.body_pos_w.torch[0, hand_index]
+                        .detach()
+                        .cpu()
+                        .tolist()
+                    )
+                ]
+        videos = encode_videos(
+            args.visual_demo_output,
+            list(args.visual_camera_names),
+            int(round(args.dataset_fps)),
+        )
+        assert visual_demo_started_at is not None
+        args.visual_demo_elapsed_seconds = round(
+            time.perf_counter() - visual_demo_started_at, 6
+        )
+        provenance = _visual_demo_provenance(
+            args,
+            frame_count=visual_frame_count,
+            videos=videos,
+        )
+        provenance_path = args.visual_demo_output / "provenance.json"
+        provenance_path.write_text(
+            json.dumps(provenance, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        report = {
+            "passed": visual_frame_count > 0
+            and all(Path(path).is_file() for path in videos.values()),
+            "output": str(args.visual_demo_output),
+            "visual_style": args.visual_style,
+            "renderer_profile_id": args.renderer_profile["id"],
+            "frames": visual_frame_count,
+            "videos": videos,
+            "provenance": str(provenance_path),
+        }
+        print(
+            f"GELLO_ISAAC_VISUAL_DEMO {json.dumps(report, sort_keys=True)}",
+            file=sys.__stderr__,
+            flush=True,
+        )
+        return bool(report["passed"])
 
     if args.smoke_steps:
         actual_joint_positions = backend.current_joint_positions()

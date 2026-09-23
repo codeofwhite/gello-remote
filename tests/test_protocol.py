@@ -34,3 +34,17 @@ def test_gello_command_rejects_invalid_targets(targets: list[float]) -> None:
             joint_targets=targets,
             gripper_closed=False,
         )
+
+
+@pytest.mark.parametrize("suffix", [":left", ":right"])
+def test_gello_command_accepts_arm_suffixed_session_ids(suffix: str) -> None:
+    """Dual GELLO is two independent 7-DoF streams routed by session_id, not a protocol change."""
+    command = GelloCommand(
+        sequence=0,
+        timestamp_ns=time.time_ns(),
+        joint_targets=[0.0] * 7,
+        gripper_closed=False,
+        session_id=f"episode-7{suffix}",
+    )
+    assert command.session_id == f"episode-7{suffix}"
+    assert len(command.joint_targets) == 7

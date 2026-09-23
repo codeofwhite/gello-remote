@@ -286,3 +286,45 @@ export class GelloSerialReader {
     this.onStatus({ level: "info", message: "Serial disconnected", connected: false });
   }
 }
+
+/**
+ * Two independent GELLO serial links, one per arm.
+ *
+ * Arm identity is chosen by the operator through separate connect actions —
+ * never inferred from USB enumeration order. Each arm keeps its own
+ * {@link GelloSerialReader}, calibration and sequence counter.
+ */
+export class DualGelloBridge {
+  constructor({ onSample, onStatus }) {
+    this.armIds = ["left", "right"];
+    this.arms = {};
+    for (const arm of this.armIds) {
+      this.arms[arm] = new GelloSerialReader({
+        onSample: (raw) => onSample(arm, raw),
+        onStatus: (status) => onStatus(arm, status),
+      });
+    }
+  }
+
+  reader(arm) {
+    const reader = this.arms[arm];
+    if (!reader) throw new Error(`unknown arm: ${arm}`);
+    return reader;
+  }
+
+  isConnected(arm) {
+    return this.reader(arm).connected;
+  }
+
+  async connect(arm) {
+    return this.reader(arm).connect();
+  }
+
+  async disconnect(arm) {
+    return this.reader(arm).disconnect();
+  }
+
+  async disconnectAll() {
+    await Promise.all(this.armIds.map((arm) => this.arms[arm].disconnect()));
+  }
+}

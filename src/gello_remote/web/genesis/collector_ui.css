@@ -114,6 +114,9 @@ kbd { display: inline-block; padding: 3px 7px; border: 1px solid #465674; border
 .safety-note span { color: var(--muted); font-size: 0.82rem; line-height: 1.5; }
 
 .setup-steps { display: grid; gap: 7px; margin: 0 0 13px; padding: 0; list-style: none; }
+.arm-panels { display: grid; gap: 12px; }
+.arm-panel { padding: 11px; border: 1px solid var(--border); border-radius: 11px; }
+.arm-panel .setup-steps { margin-bottom: 10px; }
 .setup-steps li { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 10px; color: var(--muted); background: rgba(8, 13, 21, 0.38); }
 .setup-steps li > span { display: grid; width: 27px; height: 27px; flex: 0 0 auto; place-items: center; border-radius: 50%; color: var(--muted); background: var(--surface-2); font-size: 0.76rem; font-weight: 800; }
 .setup-steps li div { display: flex; min-width: 0; flex-direction: column; gap: 2px; }

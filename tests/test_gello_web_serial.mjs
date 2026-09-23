@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   DynamixelPacketParser,
+  DualGelloBridge,
   RADIANS_PER_TICK,
   buildInstructionPacket,
   buildSyncReadPacket,
@@ -66,4 +67,33 @@ test("reports missing IDs and validates official packet CRC", () => {
   assert.deepEqual(missingDynamixelIds([1, 2, 3, 4], new Map([[1, 100], [3, 300]])), [2, 4]);
   const withoutCrc = [0xff, 0xff, 0xfd, 0x00, 0xfe, 0x09, 0x00, 0x82, 0x84, 0x00, 0x04, 0x00, 0x01, 0x02];
   assert.equal(dynamixelCrc(withoutCrc), 0xface);
+});
+
+test("dual bridge tags samples and status with the clicked arm, not USB order", () => {
+  const samples = [];
+  const statuses = [];
+  const bridge = new DualGelloBridge({
+    onSample: (arm, raw) => samples.push([arm, raw]),
+    onStatus: (arm, status) => statuses.push([arm, status]),
+  });
+
+  assert.equal(bridge.reader("left") === bridge.reader("right"), false);
+  assert.equal(bridge.isConnected("left"), false);
+  assert.equal(bridge.isConnected("right"), false);
+
+  bridge.reader("right").onSample([1, 2, 3, 4, 5, 6, 7, 8]);
+  bridge.reader("left").onSample([8, 7, 6, 5, 4, 3, 2, 1]);
+  bridge.reader("left").onStatus({ level: "info", message: "connected", connected: true });
+
+  assert.deepEqual(samples, [
+    ["right", [1, 2, 3, 4, 5, 6, 7, 8]],
+    ["left", [8, 7, 6, 5, 4, 3, 2, 1]],
+  ]);
+  assert.deepEqual(statuses, [["left", { level: "info", message: "connected", connected: true }]]);
+});
+
+test("dual bridge rejects an unknown arm instead of guessing", () => {
+  const bridge = new DualGelloBridge({ onSample: () => {}, onStatus: () => {} });
+  assert.throws(() => bridge.reader("both"), /unknown arm: both/);
+  assert.throws(() => bridge.isConnected("both"), /unknown arm: both/);
 });

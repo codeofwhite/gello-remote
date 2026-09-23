@@ -35,47 +35,109 @@
         <div><span class="step-label">GUIDED SETUP</span><h2>GELLO 启动检查</h2></div>
         <span class="mode-lock">启动锁定</span>
       </div>
-      <ol class="setup-steps">
-        <li data-step="serial"><span>1</span><div><strong>连接串口</strong><small>Chrome/Edge · localhost · 57600 bps</small></div></li>
-        <li data-step="ids"><span>2</span><div><strong>确认 ID 1–8</strong><small>八路 raw position 持续更新</small></div></li>
-        <li data-step="home"><span>3</span><div><strong>记录机械臂 Home</strong><small>让仿真 Panda 与 GELLO 初始姿态对齐</small></div></li>
-        <li data-step="gripper"><span>4</span><div><strong>标定夹爪端点</strong><small>分别记录完全张开和闭合</small></div></li>
-        <li data-step="directions"><span>5</span><div><strong>检查关节方向</strong><small>逐关节小幅运动后确认</small></div></li>
-        <li data-step="control"><span>6</span><div><strong>启用控制</strong><small>启用后标定参数将被锁定</small></div></li>
-      </ol>
+      <p id="topology-notice" class="notice notice-neutral">正在读取场景臂拓扑…</p>
 
-      <div class="control-actions">
-        <button id="serial-connect" class="button button-primary">连接 GELLO</button>
-        <button id="serial-disconnect" class="button button-ghost" disabled>断开</button>
-        <button id="capture-home" class="button button-ghost" disabled>记录 Home</button>
-        <button id="capture-open" class="button button-ghost" disabled>记录夹爪张开</button>
-        <button id="capture-closed" class="button button-ghost" disabled>记录夹爪闭合</button>
-      </div>
+      <!--
+        N-arm driven: one panel per GELLO. A single-arm scene collapses this to the
+        left panel and sends an unsuffixed session_id (unchanged wire format). A
+        dual-arm scene shows both panels and routes each stream with a `:left` /
+        `:right` session_id suffix. Arm identity is chosen by which panel the
+        operator connects, never by USB enumeration order.
+      -->
+      <div id="arm-panels" class="arm-panels">
+        <section class="arm-panel" data-arm="left" hidden>
+          <div class="direction-title">
+            <strong data-role="title">GELLO</strong>
+            <span data-role="badge">—</span>
+          </div>
+          <ol class="setup-steps">
+            <li data-role="step-serial"><span>1</span><div><strong>连接串口</strong><small>Chrome/Edge · localhost · 57600 bps</small></div></li>
+            <li data-role="step-ids"><span>2</span><div><strong>确认 ID 1–8</strong><small>八路 raw position 持续更新</small></div></li>
+            <li data-role="step-home"><span>3</span><div><strong>记录机械臂 Home</strong><small>让仿真 Panda 与 GELLO 初始姿态对齐</small></div></li>
+            <li data-role="step-gripper"><span>4</span><div><strong>标定夹爪端点</strong><small>分别记录完全张开和闭合</small></div></li>
+            <li data-role="step-directions"><span>5</span><div><strong>检查关节方向</strong><small>逐关节小幅运动后确认</small></div></li>
+            <li data-role="step-control"><span>6</span><div><strong>启用控制</strong><small>启用后标定参数将被锁定</small></div></li>
+          </ol>
+          <div class="control-actions">
+            <button data-role="connect" class="button button-primary">连接 GELLO</button>
+            <button data-role="disconnect" class="button button-ghost" disabled>断开</button>
+            <button data-role="capture-home" class="button button-ghost" disabled>记录 Home</button>
+            <button data-role="capture-open" class="button button-ghost" disabled>记录夹爪张开</button>
+            <button data-role="capture-closed" class="button button-ghost" disabled>记录夹爪闭合</button>
+          </div>
+          <div class="direction-panel">
+            <div class="direction-title"><strong>关节方向</strong><span>反向时选择 −1</span></div>
+            <div class="joint-directions">
+              <label>J1<select data-role="direction"><option value="1">+1</option><option value="-1">−1</option></select></label>
+              <label>J2<select data-role="direction"><option value="1">+1</option><option value="-1">−1</option></select></label>
+              <label>J3<select data-role="direction"><option value="1">+1</option><option value="-1">−1</option></select></label>
+              <label>J4<select data-role="direction"><option value="1">+1</option><option value="-1">−1</option></select></label>
+              <label>J5<select data-role="direction"><option value="1">+1</option><option value="-1">−1</option></select></label>
+              <label>J6<select data-role="direction"><option value="1">+1</option><option value="-1">−1</option></select></label>
+              <label>J7<select data-role="direction"><option value="1">+1</option><option value="-1">−1</option></select></label>
+            </div>
+            <label class="check-row"><input data-role="reviewed" type="checkbox">我已逐关节确认方向</label>
+          </div>
+          <div class="enable-row">
+            <button data-role="enable" class="button button-success" disabled>启用 GELLO 控制</button>
+            <button data-role="disable" class="button button-danger" disabled>停止控制</button>
+          </div>
+          <p data-role="status" class="notice notice-neutral">等待连接 GELLO</p>
+          <details class="diagnostics">
+            <summary>高级诊断：raw ticks / sequence / watchdog</summary>
+            <p data-role="raw">raw ID 1–8：等待数据</p>
+            <p data-role="diagnostics">尚未收到 GELLO 指令</p>
+          </details>
+        </section>
 
-      <div class="direction-panel">
-        <div class="direction-title"><strong>关节方向</strong><span>反向时选择 −1</span></div>
-        <div class="joint-directions">
-          <label>J1<select data-joint-direction><option value="1">+1</option><option value="-1">−1</option></select></label>
-          <label>J2<select data-joint-direction><option value="1">+1</option><option value="-1">−1</option></select></label>
-          <label>J3<select data-joint-direction><option value="1">+1</option><option value="-1">−1</option></select></label>
-          <label>J4<select data-joint-direction><option value="1">+1</option><option value="-1">−1</option></select></label>
-          <label>J5<select data-joint-direction><option value="1">+1</option><option value="-1">−1</option></select></label>
-          <label>J6<select data-joint-direction><option value="1">+1</option><option value="-1">−1</option></select></label>
-          <label>J7<select data-joint-direction><option value="1">+1</option><option value="-1">−1</option></select></label>
-        </div>
-        <label class="check-row"><input id="directions-reviewed" type="checkbox">我已逐关节确认方向</label>
+        <section class="arm-panel" data-arm="right" hidden>
+          <div class="direction-title">
+            <strong data-role="title">GELLO</strong>
+            <span data-role="badge">—</span>
+          </div>
+          <ol class="setup-steps">
+            <li data-role="step-serial"><span>1</span><div><strong>连接串口</strong><small>Chrome/Edge · localhost · 57600 bps</small></div></li>
+            <li data-role="step-ids"><span>2</span><div><strong>确认 ID 1–8</strong><small>八路 raw position 持续更新</small></div></li>
+            <li data-role="step-home"><span>3</span><div><strong>记录机械臂 Home</strong><small>让仿真 Panda 与 GELLO 初始姿态对齐</small></div></li>
+            <li data-role="step-gripper"><span>4</span><div><strong>标定夹爪端点</strong><small>分别记录完全张开和闭合</small></div></li>
+            <li data-role="step-directions"><span>5</span><div><strong>检查关节方向</strong><small>逐关节小幅运动后确认</small></div></li>
+            <li data-role="step-control"><span>6</span><div><strong>启用控制</strong><small>启用后标定参数将被锁定</small></div></li>
+          </ol>
+          <div class="control-actions">
+            <button data-role="connect" class="button button-primary">连接 GELLO</button>
+            <button data-role="disconnect" class="button button-ghost" disabled>断开</button>
+            <button data-role="capture-home" class="button button-ghost" disabled>记录 Home</button>
+            <button data-role="capture-open" class="button button-ghost" disabled>记录夹爪张开</button>
+            <button data-role="capture-closed" class="button button-ghost" disabled>记录夹爪闭合</button>
+          </div>
+          <div class="direction-panel">
+            <div class="direction-title"><strong>关节方向</strong><span>反向时选择 −1</span></div>
+            <div class="joint-directions">
+              <label>J1<select data-role="direction"><option value="1">+1</option><option value="-1">−1</option></select></label>
+              <label>J2<select data-role="direction"><option value="1">+1</option><option value="-1">−1</option></select></label>
+              <label>J3<select data-role="direction"><option value="1">+1</option><option value="-1">−1</option></select></label>
+              <label>J4<select data-role="direction"><option value="1">+1</option><option value="-1">−1</option></select></label>
+              <label>J5<select data-role="direction"><option value="1">+1</option><option value="-1">−1</option></select></label>
+              <label>J6<select data-role="direction"><option value="1">+1</option><option value="-1">−1</option></select></label>
+              <label>J7<select data-role="direction"><option value="1">+1</option><option value="-1">−1</option></select></label>
+            </div>
+            <label class="check-row"><input data-role="reviewed" type="checkbox">我已逐关节确认方向</label>
+          </div>
+          <div class="enable-row">
+            <button data-role="enable" class="button button-success" disabled>启用 GELLO 控制</button>
+            <button data-role="disable" class="button button-danger" disabled>停止控制</button>
+          </div>
+          <p data-role="status" class="notice notice-neutral">等待连接 GELLO</p>
+          <details class="diagnostics">
+            <summary>高级诊断：raw ticks / sequence / watchdog</summary>
+            <p data-role="raw">raw ID 1–8：等待数据</p>
+            <p data-role="diagnostics">尚未收到 GELLO 指令</p>
+          </details>
+        </section>
       </div>
-
-      <div class="enable-row">
-        <button id="enable-control" class="button button-success" disabled>启用 GELLO 控制</button>
-        <button id="disable-control" class="button button-danger" disabled>停止控制</button>
-      </div>
-      <p id="serial-status" class="notice notice-neutral">等待连接 GELLO</p>
 
       <details class="diagnostics">
-        <summary>高级诊断：raw ticks / sequence / watchdog</summary>
-        <p id="gello-raw">raw ID 1–8：等待数据</p>
-        <p id="gello-diagnostics">尚未收到 GELLO 指令</p>
+        <summary>服务器指标 / 事件</summary>
         <p id="metrics">等待服务器指标…</p>
         <p id="log">尚无事件</p>
       </details>

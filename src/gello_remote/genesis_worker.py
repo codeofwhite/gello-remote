@@ -15,15 +15,21 @@ import franka_only
 import gello_remote
 import numpy as np
 import websockets
-from gello_remote.control import GelloSessionGate
+from gello_remote.control import (
+    DualGelloCommandController,
+    GelloCommandController,
+    GelloSessionGate,
+    parse_arm_session_id,
+)
 from gello_remote.protocol import GelloCommandV1
 
 from franka_only.control import BrowserKeyboardControlSource
 from franka_only.camera_profiles import load_camera_profile
-from robot_data_contracts import FrankaEpisodeWriter
+from robot_data_contracts import DualFrankaEpisodeWriter, FrankaEpisodeWriter
 from franka_only.scene_registry import (
     SCENE_IDS,
     apply_scene_overrides,
+    is_cloth_scene,
     scene_catalog,
     scene_parameter_schema,
 )
@@ -175,16 +181,42 @@ class TeleopServer:
         self.keyboard_receive_timestamp_ns: int | None = None
         gs.init(backend=gs.gpu, precision="32", logging_level=args.logging_level, seed=args.seed)
         self.task_scene = build_scene(args.scene, args, args.scene_overrides)
+        # Arm topology comes from the scene. Single-arm scenes expose no ``arm_ids``;
+        # a dual scene must expose exactly ("left", "right"). Nothing is inferred.
+        scene_arm_ids = tuple(getattr(self.task_scene, "arm_ids", ()))
+        self.dual_arm = scene_arm_ids == ("left", "right")
+        self.arm_ids = scene_arm_ids if scene_arm_ids else ("panda",)
+        self.dual_gello: DualGelloCommandController | None = None
+        # Time-shared keyboard: one command source per arm, driven by Tab.
+        # Single-arm scenes keep using ``self.control`` unchanged.
+        self.arm_controls: dict[str, BrowserKeyboardControlSource] = {}
+        self.active_arm = "left"
+        if self.dual_arm:
+            self.arm_controls = {
+                "left": BrowserKeyboardControlSource(args.position_step, args.rotation_step),
+                "right": BrowserKeyboardControlSource(args.position_step, args.rotation_step),
+            }
+            if args.control_source == "gello":
+                self.dual_gello = self._build_dual_gello_controller()
         geometry_metadata = self.task_scene.geometry_metadata()
         control_source = (
             "browser_keyboard" if args.control_source == "keyboard" else "gello_joint_targets"
         )
-        operator_command_names = (
-            ["dx_m", "dy_m", "dz_m", "droll_rad", "dpitch_rad", "dyaw_rad", "gripper_m"]
-            if args.control_source == "keyboard"
-            else [f"requested_joint_position/panda_joint{i}_rad" for i in range(1, 8)]
-        )
-        self.recorder = FrankaEpisodeWriter(
+        if args.control_source == "keyboard":
+            operator_command_names = [
+                "dx_m", "dy_m", "dz_m", "droll_rad", "dpitch_rad", "dyaw_rad", "gripper_m"
+            ]
+        else:
+            operator_command_names = [
+                f"requested_joint_position/panda_joint{i}_rad" for i in range(1, 8)
+            ]
+        if self.dual_arm:
+            # Left block then right block; names are the single-arm names with an arm prefix.
+            operator_command_names = [
+                f"{arm}/{name}" for arm in ("left", "right") for name in operator_command_names
+            ]
+        writer_class = DualFrankaEpisodeWriter if self.dual_arm else FrankaEpisodeWriter
+        self.recorder = writer_class(
             args.data_dir,
             fps=args.control_fps,
             engine_id="genesis",
@@ -198,10 +230,15 @@ class TeleopServer:
             operator_command_names=operator_command_names,
             camera_names=self.task_scene.camera_names,
             run_metadata={
-                "robot": "Genesis built-in Franka Panda with original parallel gripper",
+                "robot": (
+                    "Two Genesis built-in Franka Panda with original parallel grippers"
+                    if self.dual_arm
+                    else "Genesis built-in Franka Panda with original parallel gripper"
+                ),
+                "arm_ids": list(self.arm_ids),
                 "object_assets": (
                     "Genesis built-in cloth.obj with PBD material"
-                    if args.scene == "cloth_corner_lift"
+                    if is_cloth_scene(args.scene)
                     else "Genesis primitives defined by SceneSpec"
                 ),
                 "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", "unset"),
@@ -217,29 +254,115 @@ class TeleopServer:
                 "resolved_scene_spec": self.task_scene.resolved_scene_spec(),
                 "control_source": control_source,
                 "control_source_options": ["browser_keyboard", "gello_joint_targets"],
-                "operator_command_layouts": {
-                    "browser_keyboard": [
-                        "dx_m", "dy_m", "dz_m", "droll_rad", "dpitch_rad", "dyaw_rad", "gripper_m"
-                    ],
-                    "gello_joint_targets": [f"panda_joint{i}_rad" for i in range(1, 8)],
-                },
+                "operator_command_layouts": self._operator_command_layouts(),
                 "git_roots": {"gello_remote": Path(gello_remote.__file__).resolve().parents[2],
                               "clothtwin": PROJECT_ROOT},
                 "dependency_packages": ["genesis-world", "numpy", "opencv-python"],
             },
         )
 
+    def _operator_command_layouts(self) -> dict[str, list[str]]:
+        """Name the operator command channels actually used by this arm topology."""
+        keyboard = ["dx_m", "dy_m", "dz_m", "droll_rad", "dpitch_rad", "dyaw_rad", "gripper_m"]
+        gello = [f"panda_joint{i}_rad" for i in range(1, 8)]
+        if not self.dual_arm:
+            return {"browser_keyboard": keyboard, "gello_joint_targets": gello}
+        return {
+            "browser_keyboard": [f"{arm}/{n}" for arm in ("left", "right") for n in keyboard],
+            "gello_joint_targets": [f"{arm}/{n}" for arm in ("left", "right") for n in gello],
+        }
+
+    def _dual_joint_limits(self) -> list[list[tuple[float, float]]]:
+        """Per-arm 7-DoF limits taken from the scene so both safety layers agree."""
+        low = np.asarray(self.task_scene.arm_joint_low, dtype=np.float32).reshape(-1)
+        high = np.asarray(self.task_scene.arm_joint_high, dtype=np.float32).reshape(-1)
+        if low.shape != (14,) or high.shape != (14,):
+            raise RuntimeError(
+                "a dual-arm scene must expose 14 per-arm joint limits "
+                f"(left 7 then right 7); got low={low.shape}, high={high.shape}"
+            )
+        return [
+            [(float(low[i]), float(high[i])) for i in range(offset, offset + 7)]
+            for offset in (0, 7)
+        ]
+
+    def _build_dual_gello_controller(self) -> DualGelloCommandController:
+        limits = self._dual_joint_limits()
+        initial = np.asarray(self.task_scene.arm_target, dtype=np.float32).reshape(-1)
+        if initial.shape != (14,):
+            raise RuntimeError(
+                f"a dual-arm scene must expose a 14-DoF arm_target; got {initial.shape}"
+            )
+        # Match the scene's per-tick slew so the two safety layers do not fight.
+        max_joint_speed = float(self.task_scene.max_joint_target_step) * float(self.args.control_fps)
+        arms = {
+            "left": GelloCommandController(
+                initial[:7], limits[0],
+                control_hz=self.args.control_fps,
+                max_joint_speed=max_joint_speed,
+                watchdog_timeout=self.args.gello_timeout,
+            ),
+            "right": GelloCommandController(
+                initial[7:], limits[1],
+                control_hz=self.args.control_fps,
+                max_joint_speed=max_joint_speed,
+                watchdog_timeout=self.args.gello_timeout,
+            ),
+        }
+        return DualGelloCommandController(arms["left"], arms["right"])
+
+    def _require_both_arms_live(self) -> None:
+        """Hard gate for dual GELLO episodes. No single-arm fallback, ever."""
+        assert self.dual_gello is not None
+        now = time.monotonic()
+        status = self.dual_gello.status(now=now)
+        stale = []
+        for arm in ("left", "right"):
+            arm_status = status[arm]
+            age_ms = arm_status.get("age_ms")
+            fresh = age_ms is not None and float(age_ms) <= self.args.gello_timeout * 1000.0
+            if arm_status.get("session_id") is None or not fresh:
+                stale.append(f"{arm}(session={arm_status.get('session_id')}, age_ms={age_ms})")
+        if stale:
+            raise RuntimeError(
+                "Refusing to start a dual-arm episode without both GELLO arms streaming: "
+                + ", ".join(stale)
+                + " (dual teleoperation is synchronous; there is no single-arm fallback)"
+            )
+
+    def _keyboard_source(self) -> BrowserKeyboardControlSource:
+        """The arm the operator is currently driving.
+
+        Single-arm scenes always return ``self.control`` so that path stays
+        bit-identical. A dual scene returns the active arm's own source.
+        """
+        if not self.dual_arm:
+            return self.control
+        return self.arm_controls[self.active_arm]
+
+    def _keyboard_sources(self) -> tuple[BrowserKeyboardControlSource, ...]:
+        """Every live keyboard source. Key-up must clear the arm that holds the key."""
+        if not self.dual_arm:
+            return (self.control,)
+        return (self.arm_controls["left"], self.arm_controls["right"])
+
     def reset(self) -> str:
         if self.recorder.is_recording:
             raise RuntimeError("Finish or discard the active episode before resetting")
         self.task_scene.reset()
         self.control.reset()
+        for source in self._keyboard_sources():
+            source.reset()
         self.sim_time = 0.0
         return "Environment reset"
 
     def start(self, task: str) -> str:
         if self.recorder.is_recording:
             raise RuntimeError("An episode is already recording")
+        # Gate before reset(): reset drops nothing here, but the gate reads live
+        # command ages and must judge the operator's actual streaming state.
+        if self.dual_arm and self.args.control_source == "gello":
+            self._require_both_arms_live()
         self.reset()
         if self.args.control_source == "keyboard" and self.keyboard_sequence is None:
             self.keyboard_sequence = 0
@@ -278,7 +401,23 @@ class TeleopServer:
             return self.finish(False)
         if code == "Backspace" and self.recorder.is_recording:
             return self.discard()
-        return self.control.keydown(code)
+        if code == "Tab":
+            return self._switch_active_arm()
+        return self._keyboard_source().keydown(code)
+
+    def _switch_active_arm(self) -> str | None:
+        """Time-share the keyboard: Tab moves control to the other arm.
+
+        The arm being left has its held motion keys cleared, so a key that is
+        still physically down cannot keep driving the arm the operator just
+        switched away from. Each arm keeps its own gripper state.
+        """
+        if not self.dual_arm:
+            return None
+        outgoing = self.active_arm
+        self.active_arm = "right" if outgoing == "left" else "left"
+        self.arm_controls[outgoing].pressed_keys.clear()
+        return f"ACTIVE: {self.active_arm.upper()}"
 
     def record_keyboard_event(
         self, sequence: int, timestamp_ns: int, *, received_at_ns: int | None = None
@@ -308,6 +447,21 @@ class TeleopServer:
             raise ValueError("GELLO commands are disabled in keyboard mode")
         command = parse_gello_message(data)
         received_at = time.monotonic()
+        routed = parse_arm_session_id(command.session_id)
+        if self.dual_arm:
+            if routed is None:
+                raise ValueError(
+                    "Dual-arm scenes route GELLO by session_id suffix; expected "
+                    f"'<base>:left' or '<base>:right', got {command.session_id!r}"
+                )
+            return self._handle_dual_arm_gello(command, received_at, routed[1])
+        if routed is not None:
+            raise ValueError(
+                f"Arm-suffixed session {command.session_id!r} requires a dual-arm scene"
+            )
+        return self._handle_single_arm_gello(command, received_at)
+
+    def _handle_single_arm_gello(self, command: GelloCommandV1, received_at: float) -> str | None:
         if not self.gello_session_gate.accept(command, received_at=received_at):
             return f"Ignored stale or competing GELLO sequence {command.sequence} for session {command.session_id}"
         self.gello_last_sequences[command.session_id] = command.sequence
@@ -319,6 +473,25 @@ class TeleopServer:
         self.gello_gripper_closed = command.gripper_closed
         self._watchdog_holding = False
         return None
+
+    def _handle_dual_arm_gello(
+        self, command: GelloCommandV1, received_at: float, arm: str
+    ) -> str | None:
+        assert self.dual_gello is not None
+        if not self.dual_gello.submit(command, arm=arm, received_at=received_at):
+            return f"Ignored stale or competing GELLO sequence {command.sequence} for session {command.session_id}"
+        self.gello_last_sequences[command.session_id] = command.sequence
+        return None
+
+    def release_gello_session(self, session_id: str) -> None:
+        """Release one exact session id from the gate that holds it."""
+        if self.dual_arm:
+            assert self.dual_gello is not None
+            self.dual_gello.release_session(session_id)
+            self.gello_last_sequences.pop(session_id, None)
+        else:
+            self.gello_session_gate.release(session_id)
+            self.gello_last_sequences.pop(session_id, None)
 
     def handle_reconfigure(self, data: dict) -> str:
         if self.recorder.is_recording:
@@ -343,14 +516,158 @@ class TeleopServer:
         if argv:
             os.execv(sys.executable, argv)
 
+    def _dual_gello_stages(self) -> tuple:
+        """One coupled dual-arm GELLO cycle.
+
+        Both arms are advanced only when both streams are live; otherwise the
+        ``DualGelloCommandController`` freezes both. Native action layout is left
+        7 joints + 2 gripper widths then right 7 + 2 (18 total). ``operator_command``
+        is the raw per-arm ask (14), matching the single-arm rule that records what
+        the operator requested before safety filtering.
+        """
+        assert self.dual_gello is not None
+        dual = self.dual_gello.tick(now=time.monotonic())
+        left, right = dual.left, dual.right
+        left_closed = bool(left.gripper_closed)
+        right_closed = bool(right.gripper_closed)
+        action, _ = self.task_scene.prepare_joint_action(
+            np.concatenate(
+                [
+                    np.asarray(left.joint_targets, dtype=np.float32),
+                    np.asarray(right.joint_targets, dtype=np.float32),
+                ]
+            ),
+            (left_closed, right_closed),
+        )
+        left_ask = np.asarray(left.requested_joint_targets, dtype=np.float32)
+        right_ask = np.asarray(right.requested_joint_targets, dtype=np.float32)
+        left_width = 0.0 if left_closed else 0.04
+        right_width = 0.0 if right_closed else 0.04
+        requested_action = np.concatenate(
+            [left_ask, [left_width, left_width], right_ask, [right_width, right_width]]
+        ).astype(np.float32)
+        operator_command = np.concatenate([left_ask, right_ask]).astype(np.float32)
+        (
+            control_sequence,
+            control_timestamp_ns,
+            control_receive_timestamp_ns,
+            extra,
+        ) = self._dual_control_provenance(left, right, dual.coupled_hold)
+        return (
+            requested_action,
+            action,
+            operator_command,
+            control_sequence,
+            control_timestamp_ns,
+            control_receive_timestamp_ns,
+            extra,
+        )
+
+    @staticmethod
+    def _dual_control_provenance(left, right, coupled_hold: bool) -> tuple:
+        """Scalar provenance from the fresher arm; the full per-arm split is kept.
+
+        A dual frame has two independent 7-DoF commands, so the scalar
+        ``control_*`` fields cannot hold both. When the pair is advancing they
+        carry the more recently received arm; when coupled hold freezes the pair
+        they are -1 (matching the single-arm hold rule). ``extra_arrays`` always
+        keeps both arms' sequence and timestamps plus the hold flag.
+        """
+
+        def block(prefix: str, side) -> dict[str, np.ndarray]:
+            return {
+                f"{prefix}_control_sequence": np.asarray(
+                    [side.sequence if side.sequence is not None else -1], dtype=np.int64
+                ),
+                f"{prefix}_control_timestamp_ns": np.asarray(
+                    [side.source_timestamp_ns if side.source_timestamp_ns is not None else -1],
+                    dtype=np.int64,
+                ),
+                f"{prefix}_control_receive_timestamp_ns": np.asarray(
+                    [side.receive_timestamp_ns if side.receive_timestamp_ns is not None else -1],
+                    dtype=np.int64,
+                ),
+            }
+
+        extra = {
+            **block("left", left),
+            **block("right", right),
+            "dual_coupled_hold": np.asarray([coupled_hold], dtype=np.bool_),
+        }
+        both = (
+            left.receive_timestamp_ns is not None and right.receive_timestamp_ns is not None
+        )
+        if coupled_hold or not both:
+            return -1, -1, -1, extra
+        newer = left if left.receive_timestamp_ns >= right.receive_timestamp_ns else right
+        return (
+            int(newer.sequence) if newer.sequence is not None else -1,
+            int(newer.source_timestamp_ns) if newer.source_timestamp_ns is not None else -1,
+            int(newer.receive_timestamp_ns),
+            extra,
+        )
+
+    def _dual_keyboard_provenance(self) -> dict[str, np.ndarray]:
+        """Per-arm split for a time-shared dual keyboard frame.
+
+        Only the active arm has a live browser event this tick; the idle arm's
+        three scalars are -1. ``dual_active_arm`` is 0 for left, 1 for right, and
+        ``dual_coupled_hold`` is always False here: a hold means no command is
+        advancing either arm, which is the GELLO watchdog's job, not Tab's.
+        """
+        active = self.active_arm
+
+        def block(prefix: str, live: bool) -> dict[str, np.ndarray]:
+            has_event = live and self.keyboard_sequence is not None
+            return {
+                f"{prefix}_control_sequence": np.asarray(
+                    [int(self.keyboard_sequence) if has_event else -1], dtype=np.int64
+                ),
+                f"{prefix}_control_timestamp_ns": np.asarray(
+                    [int(self.keyboard_timestamp_ns) if has_event else -1], dtype=np.int64
+                ),
+                f"{prefix}_control_receive_timestamp_ns": np.asarray(
+                    [
+                        int(self.keyboard_receive_timestamp_ns)
+                        if has_event and self.keyboard_receive_timestamp_ns is not None
+                        else -1
+                    ],
+                    dtype=np.int64,
+                ),
+            }
+
+        return {
+            **block("left", active == "left"),
+            **block("right", active == "right"),
+            "dual_active_arm": np.asarray([0 if active == "left" else 1], dtype=np.int8),
+            "dual_coupled_hold": np.asarray([False], dtype=np.bool_),
+        }
+
     def control_tick(self) -> bytes:
         gello_fresh = (
             self.gello_received_at is not None
             and time.monotonic() - self.gello_received_at <= self.args.gello_timeout
         )
-        if self.args.control_source == "keyboard":
-            sample = self.control.sample()
-            requested_action, action, operator_command = self.task_scene.prepare_action_stages(sample)
+        dual_provenance: dict[str, np.ndarray] = {}
+        if self.dual_arm and self.args.control_source == "gello":
+            (
+                requested_action,
+                action,
+                operator_command,
+                control_sequence,
+                control_timestamp_ns,
+                control_receive_timestamp_ns,
+                dual_provenance,
+            ) = self._dual_gello_stages()
+        elif self.args.control_source == "keyboard":
+            sample = self._keyboard_source().sample()
+            if self.dual_arm:
+                requested_action, action, operator_command = self.task_scene.prepare_keyboard_action(
+                    sample, self.active_arm
+                )
+                dual_provenance = self._dual_keyboard_provenance()
+            else:
+                requested_action, action, operator_command = self.task_scene.prepare_action_stages(sample)
             control_sequence = int(self.keyboard_sequence) if self.keyboard_sequence is not None else -1
             control_timestamp_ns = (
                 int(self.keyboard_timestamp_ns) if self.keyboard_timestamp_ns is not None else -1
@@ -411,6 +728,7 @@ class TeleopServer:
                 capture_timestamp_ns=capture_timestamp_ns,
                 cloth_particles=observation.cloth_particles,
                 cloth_particle_velocities=observation.cloth_particle_velocities,
+                extra_arrays=dual_provenance,
             )
         self.sim_time += self.args.sim_dt * self.args.physics_steps_per_control
         mosaic = self._compose_mosaic(images)
@@ -430,21 +748,33 @@ class TeleopServer:
             self._fps_window_started = now
         return jpeg.tobytes()
 
-    @staticmethod
-    def _compose_mosaic(images: dict[str, np.ndarray]) -> np.ndarray:
-        labels = {
-            "base": "1  THIRD-PERSON",
-            "top": "2  TOP",
-            "side": "3  SIDE",
-            "wrist": "4  WRIST",
-        }
+    def _compose_mosaic(self, images: dict[str, np.ndarray]) -> np.ndarray:
+        # The live mosaic stays 2x2 so the browser zoom grid in collector_common.mjs
+        # keeps working unchanged. Dual-arm streams put both wrists in the bottom
+        # row; the `side` view is still rendered and recorded in the episode, it is
+        # only left out of the live mosaic.
+        tiles = (
+            (
+                ("base", "1  THIRD-PERSON"),
+                ("top", "2  TOP"),
+                ("left_wrist", "3  LEFT WRIST"),
+                ("right_wrist", "4  RIGHT WRIST"),
+            )
+            if self.dual_arm
+            else (
+                ("base", "1  THIRD-PERSON"),
+                ("top", "2  TOP"),
+                ("side", "3  SIDE"),
+                ("wrist", "4  WRIST"),
+            )
+        )
         views = []
-        for name in ("base", "top", "side", "wrist"):
+        for name, label in tiles:
             view = images[name].copy()
             cv2.rectangle(view, (0, 0), (230, 32), (12, 12, 12), thickness=-1)
             cv2.putText(
                 view,
-                labels[name],
+                label,
                 (10, 22),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.58,
@@ -458,30 +788,13 @@ class TeleopServer:
             axis=0,
         )
 
-    def status(self, log: str | None = None) -> dict:
-        status = {
-            "scene_id": self.task_scene.scene_id,
-            "scene_description": self.task_scene.spec.description,
-            "default_task": self.task_scene.task_instruction,
-            "recording": self.recorder.is_recording,
-            "episode": self.current_episode,
-            "frames": self.recorder.frame_count,
-            "task": self.current_task,
-            "metrics": self.task_scene.status_metrics(),
-            "stream_fps": self.stream_fps,
-            "control_mode": self.args.control_source,
-            "scene_catalog": scene_catalog(),
-            "scene_parameters": scene_parameter_schema(self.task_scene.scene_id),
-            "resolved_scene_spec": self.task_scene.resolved_scene_spec(),
-            "runtime": {
-                "sim_dt_s": self.args.sim_dt,
-                "substeps": self.args.substeps,
-                "physics_steps_per_control": self.args.physics_steps_per_control,
-                "control_fps": self.args.control_fps,
-                "camera_resolution": [self.args.width, self.args.height],
-                "camera_profile": self.task_scene.camera_profile,
-            },
-            "gello": {
+    def _gello_status(self) -> dict:
+        """Top-level keys stay single-arm shaped so the browser latency chip keeps working."""
+        # Keyboard mode never builds a DualGelloCommandController, so a dual scene
+        # has no per-arm GELLO state to report. Report the no-session status rather
+        # than asserting: status() runs on every websocket connect and every frame.
+        if not self.dual_arm or self.dual_gello is None:
+            return {
                 "connected": bool(
                     self.gello_received_at is not None
                     and time.monotonic() - self.gello_received_at <= self.args.gello_timeout
@@ -499,7 +812,66 @@ class TeleopServer:
                     else None
                 ),
                 "watchdog_holds": self.gello_watchdog_holds,
+            }
+        assert self.dual_gello is not None
+        now = time.monotonic()
+        combined = self.dual_gello.status(now=now)
+        arms = {"left": combined["left"], "right": combined["right"]}
+        ages = [arms[arm]["age_ms"] for arm in ("left", "right")]
+        source_ages = [arms[arm]["source_age_ms"] for arm in ("left", "right")]
+        live = [
+            arms[arm]["session_id"] is not None
+            and arms[arm]["age_ms"] is not None
+            and float(arms[arm]["age_ms"]) <= self.args.gello_timeout * 1000.0
+            for arm in ("left", "right")
+        ]
+        return {
+            "connected": all(live),
+            "arms": arms,
+            "coupled_hold": combined["coupled_hold"],
+            "coupled_holds": combined["coupled_holds"],
+            "sequence": max(
+                (arms[arm]["sequence"] for arm in ("left", "right") if arms[arm]["sequence"] is not None),
+                default=None,
+            ),
+            "session_id": {
+                arm: arms[arm]["session_id"] for arm in ("left", "right")
             },
+            # Staler arm wins so the chip reflects the pair, not the leader.
+            "age_ms": max((value for value in ages if value is not None), default=None),
+            "source_age_ms": max(
+                (value for value in source_ages if value is not None), default=None
+            ),
+            "watchdog_holds": sum(arms[arm]["watchdog_holds"] for arm in ("left", "right")),
+        }
+
+    def status(self, log: str | None = None) -> dict:
+        status = {
+            "scene_id": self.task_scene.scene_id,
+            "scene_description": self.task_scene.spec.description,
+            "default_task": self.task_scene.task_instruction,
+            "recording": self.recorder.is_recording,
+            "episode": self.current_episode,
+            "frames": self.recorder.frame_count,
+            "task": self.current_task,
+            "metrics": self.task_scene.status_metrics(),
+            "stream_fps": self.stream_fps,
+            "control_mode": self.args.control_source,
+            "arm_ids": list(self.arm_ids),
+            "dual_arm": self.dual_arm,
+            "active_arm": self.active_arm if self.dual_arm else None,
+            "scene_catalog": scene_catalog(),
+            "scene_parameters": scene_parameter_schema(self.task_scene.scene_id),
+            "resolved_scene_spec": self.task_scene.resolved_scene_spec(),
+            "runtime": {
+                "sim_dt_s": self.args.sim_dt,
+                "substeps": self.args.substeps,
+                "physics_steps_per_control": self.args.physics_steps_per_control,
+                "control_fps": self.args.control_fps,
+                "camera_resolution": [self.args.width, self.args.height],
+                "camera_profile": self.task_scene.camera_profile,
+            },
+            "gello": self._gello_status(),
         }
         if log:
             status["log"] = log
@@ -509,7 +881,8 @@ class TeleopServer:
 async def ws_handler(websocket, server: TeleopServer) -> None:
     server.clients.add(websocket)
     legacy_gello_session_id = f"legacy-{time.time_ns()}-{id(websocket)}"
-    bound_gello_session_id: str | None = None
+    # A dual GELLO page owns two arm streams; each binds its own session id.
+    bound_gello_session_ids: set[str] = set()
     last_keyboard_sequence: int | None = None
     await websocket.send(json.dumps(server.status("Client connected")))
     try:
@@ -537,14 +910,17 @@ async def ws_handler(websocket, server: TeleopServer) -> None:
                     )
                     last_keyboard_sequence = sequence
                     server.record_keyboard_event(sequence, timestamp_ns)
-                    server.control.keyup(data["code"])
+                    # Clear from every source: the key may still be held on the arm
+                    # the operator switched away from, whose source is no longer active.
+                    for source in server._keyboard_sources():
+                        source.keyup(data["code"])
                 elif message_type == "command":
                     log = server.handle_command(data["command"], data.get("task", server.task_scene.task_instruction))
                 elif message_type == "gello":
                     data.setdefault("session_id", legacy_gello_session_id)
                     log = server.handle_gello(data)
                     if log is None:
-                        bound_gello_session_id = str(data["session_id"])
+                        bound_gello_session_ids.add(str(data["session_id"]))
                 elif message_type == "reconfigure":
                     log = server.handle_reconfigure(data)
                 if log:
@@ -556,8 +932,8 @@ async def ws_handler(websocket, server: TeleopServer) -> None:
     except websockets.exceptions.ConnectionClosed:
         pass
     finally:
-        if bound_gello_session_id is not None:
-            server.gello_session_gate.release(bound_gello_session_id)
+        for session_id in bound_gello_session_ids:
+            server.release_gello_session(session_id)
         server.clients.discard(websocket)
         server.control.pressed_keys.clear()
 

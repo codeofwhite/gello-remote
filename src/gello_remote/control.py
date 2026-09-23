@@ -115,9 +115,11 @@ class GelloCommandController:
         self._last_sequence: int | None = None
         self._gripper_closed = False
         self._watchdog_holding = False
+        self._force_holding = False
         self._accepted_commands = 0
         self._rejected_stale_commands = 0
         self._watchdog_holds = 0
+        self._force_holds = 0
 
     @staticmethod
     def _clip(
@@ -158,9 +160,27 @@ class GelloCommandController:
             self._latest_received_at = None
             self._gripper_closed = False
             self._watchdog_holding = False
+            self._force_holding = False
 
-    def tick(self, *, now: float | None = None) -> SafeFrankaCommand:
-        """Advance one control cycle and return the safety-filtered command."""
+    def is_fresh(self, *, now: float | None = None) -> bool:
+        """True when a stored command is inside the watchdog window at ``now``."""
+        current_time = self._clock() if now is None else float(now)
+        if not math.isfinite(current_time):
+            raise ValueError("now must be finite")
+        with self._lock:
+            return (
+                self._latest is not None
+                and self._latest_received_at is not None
+                and current_time - self._latest_received_at <= self._watchdog_timeout
+            )
+
+    def tick(self, *, now: float | None = None, force_hold: bool = False) -> SafeFrankaCommand:
+        """Advance one control cycle and return the safety-filtered command.
+
+        ``force_hold=True`` freezes the held target and gripper for this cycle.
+        It is how :class:`DualGelloCommandController` couples the arms and it
+        never loosens joint, slew-rate, sequence or watchdog enforcement.
+        """
         current_time = self._clock() if now is None else float(now)
         if not math.isfinite(current_time):
             raise ValueError("now must be finite")
@@ -171,6 +191,12 @@ class GelloCommandController:
                 and current_time - self._latest_received_at <= self._watchdog_timeout
             )
             if fresh:
+                self._watchdog_holding = False
+            elif self._latest_received_at is not None and not self._watchdog_holding:
+                self._watchdog_holding = True
+                self._watchdog_holds += 1
+
+            if fresh and not force_hold:
                 assert self._latest is not None
                 desired = self._clip(validate_joint_targets(self._latest.joint_targets), self._joint_limits)
                 self._target = tuple(
@@ -178,10 +204,13 @@ class GelloCommandController:
                     for current, wanted in zip(self._target, desired)
                 )
                 self._gripper_closed = self._latest.gripper_closed
-                self._watchdog_holding = False
-            elif self._latest_received_at is not None and not self._watchdog_holding:
-                self._watchdog_holding = True
-                self._watchdog_holds += 1
+
+            if force_hold:
+                if not self._force_holding:
+                    self._force_holds += 1
+                self._force_holding = True
+            else:
+                self._force_holding = False
 
             return SafeFrankaCommand(
                 joint_targets=self._target,
@@ -216,8 +245,87 @@ class GelloCommandController:
                 "source_age_ms": round(source_age_ms, 1) if source_age_ms is not None else None,
                 "watchdog_holding": self._watchdog_holding,
                 "watchdog_holds": self._watchdog_holds,
+                "force_holding": self._force_holding,
+                "force_holds": self._force_holds,
                 "accepted_commands": self._accepted_commands,
                 "rejected_stale_commands": self._rejected_stale_commands,
                 "joint_targets": list(self._target),
                 "gripper_closed": self._gripper_closed,
             }
+
+
+DUAL_ARMS = ("left", "right")
+
+
+def arm_session_id(base_session_id: str, arm: str) -> str:
+    """Build the per-arm session id. Single-arm callers pass through ``base`` unchanged."""
+    if arm not in DUAL_ARMS:
+        raise ValueError(f"unknown arm: {arm!r}; expected one of {list(DUAL_ARMS)}")
+    return f"{base_session_id}:{arm}"
+
+
+def parse_arm_session_id(session_id: str) -> tuple[str, str] | None:
+    """Split ``base:left``/``base:right``; return None for an unsuffixed single-arm id."""
+    base, separator, arm = session_id.rpartition(":")
+    if separator and arm in DUAL_ARMS and base:
+        return base, arm
+    return None
+
+
+@dataclass(frozen=True)
+class SafeDualFrankaCommand:
+    """One safety-filtered dual-arm command. Arms stay separate; order is not a layout."""
+
+    left: SafeFrankaCommand
+    right: SafeFrankaCommand
+    coupled_hold: bool
+
+
+class DualGelloCommandController:
+    """Two audited single-arm controllers coupled by a both-arms-hold rule.
+
+    Each arm keeps its own unmodified :class:`GelloCommandController`. The only
+    added semantics: when one arm cannot advance this cycle, the other freezes
+    too. Nothing here loosens joint, velocity, sequence or watchdog enforcement.
+    """
+
+    def __init__(self, left: GelloCommandController, right: GelloCommandController) -> None:
+        self._arms = {"left": left, "right": right}
+        self._coupled_hold = False
+        self._coupled_holds = 0
+
+    def submit(self, command: GelloCommand, *, arm: str, received_at: float | None = None) -> bool:
+        if arm not in self._arms:
+            raise ValueError(f"unknown arm: {arm!r}; expected one of {sorted(self._arms)}")
+        return self._arms[arm].submit(command, received_at=received_at)
+
+    def reset_targets(self, left_targets: Sequence[float], right_targets: Sequence[float]) -> None:
+        self._arms["left"].reset_targets(left_targets)
+        self._arms["right"].reset_targets(right_targets)
+
+    def release_session(self, session_id: str) -> None:
+        """Release one exact session id; call once per arm id to release both."""
+        for controller in self._arms.values():
+            controller.release_session(session_id)
+
+    def tick(self, *, now: float | None = None) -> SafeDualFrankaCommand:
+        # Freeze an arm whose partner is stale. A concurrent submit can only make
+        # the partner fresher, so this decision errs toward holding, never toward
+        # advancing a lone arm.
+        hold_left = not self._arms["right"].is_fresh(now=now)
+        hold_right = not self._arms["left"].is_fresh(now=now)
+        left = self._arms["left"].tick(now=now, force_hold=hold_left)
+        right = self._arms["right"].tick(now=now, force_hold=hold_right)
+        coupled = hold_left or hold_right
+        if coupled and not self._coupled_hold:
+            self._coupled_holds += 1
+        self._coupled_hold = coupled
+        return SafeDualFrankaCommand(left=left, right=right, coupled_hold=coupled)
+
+    def status(self, *, now: float | None = None) -> dict[str, object]:
+        return {
+            "left": self._arms["left"].status(now=now),
+            "right": self._arms["right"].status(now=now),
+            "coupled_hold": self._coupled_hold,
+            "coupled_holds": self._coupled_holds,
+        }
