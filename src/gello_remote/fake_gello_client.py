@@ -15,11 +15,14 @@ from .protocol import GelloCommand
 FRANKA_HOME = (0.0, -0.65, 0.0, -2.25, 0.0, 1.75, 0.78)
 
 
-def make_command(sequence: int, elapsed_s: float, *, amplitude: float) -> GelloCommand:
+def make_command(
+    sequence: int, elapsed_s: float, *, amplitude: float, session_id: str
+) -> GelloCommand:
     targets = list(FRANKA_HOME)
     targets[0] += amplitude * math.sin(0.5 * elapsed_s)
     targets[5] += amplitude * 0.5 * math.sin(0.35 * elapsed_s)
     return GelloCommand(
+        session_id=session_id,
         sequence=sequence,
         timestamp_ns=time.time_ns(),
         joint_targets=targets,
@@ -27,7 +30,7 @@ def make_command(sequence: int, elapsed_s: float, *, amplitude: float) -> GelloC
     )
 
 
-async def run(url: str, fps: float, duration: float, amplitude: float) -> None:
+async def run(url: str, fps: float, duration: float, amplitude: float, session_id: str) -> None:
     try:
         import websockets
     except ImportError as exc:
@@ -45,7 +48,9 @@ async def run(url: str, fps: float, duration: float, amplitude: float) -> None:
             sequence = 0
             while duration <= 0 or time.monotonic() - started < duration:
                 tick_started = time.monotonic()
-                command = make_command(sequence, tick_started - started, amplitude=amplitude)
+                command = make_command(
+                    sequence, tick_started - started, amplitude=amplitude, session_id=session_id
+                )
                 await websocket.send(json.dumps({"type": "gello", **command.model_dump()}))
                 sequence += 1
                 remaining = period - (time.monotonic() - tick_started)
@@ -64,10 +69,20 @@ def main() -> None:
     parser.add_argument("--fps", type=float, default=20.0)
     parser.add_argument("--duration", type=float, default=10.0, help="seconds; 0 runs until interrupted")
     parser.add_argument("--amplitude", type=float, default=0.15, help="maximum test motion in radians")
+    parser.add_argument(
+        "--arm",
+        choices=("left", "right"),
+        default=None,
+        help=(
+            "stream as one arm of a dual-arm scene by suffixing the session id "
+            "('fake:left' / 'fake:right'); omit for a single-arm scene"
+        ),
+    )
     args = parser.parse_args()
     if args.fps <= 0 or args.duration < 0 or not 0 < args.amplitude <= 0.25:
         parser.error("fps must be positive, duration non-negative, and amplitude in (0, 0.25]")
-    asyncio.run(run(args.url, args.fps, args.duration, args.amplitude))
+    session_id = f"fake:{args.arm}" if args.arm else "legacy"
+    asyncio.run(run(args.url, args.fps, args.duration, args.amplitude, session_id))
 
 
 if __name__ == "__main__":
