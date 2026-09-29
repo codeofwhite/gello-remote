@@ -239,6 +239,16 @@ above that threshold for one second, and then release. The worker records end-
 effector pose, object pose, and object velocity, and stores an independent
 `isaac_cube_lift_v1` evaluator result alongside the operator outcome.
 
+Select `--scene l_table_basket` together with
+`--scene-usd /absolute/path/to/scene.usda` to load a fixture scene asset instead
+of spawning cuboids. The reference names the asset's root prim explicitly because
+these assets carry no USD default prim, and the asset's own rigged robot
+(`FrankaLeft`) is deactivated so it cannot interpenetrate the spawned Franka.
+The L-table, basket, and robot pedestal keep the collision geometry authored in
+the asset; only the fixture prims the scene depends on are verified. This scene
+has no task object and no evaluator, so it writes only the operator outcome; the
+Franka is placed at the asset's robot pose and driven by teleoperation alone.
+
 Pass `--camera-profile-file /absolute/path/to/profile.json` to select the same
 sensor profile used by RoboData Studio. The lab profile models the active main
 D435i (`261722075807`) as `base` and the active wrist D435i (`261622075579`) as

@@ -43,7 +43,12 @@ STREAM_CAMERA_TARGET = (0.45, 0.0, 0.65)
 STREAM_WIDTH = 960
 STREAM_HEIGHT = 720
 STREAM_SCENE_PRIMS = ("/World/Franka", "/World/defaultGroundPlane", "/World/Light")
-ISAAC_SCENE_IDS = ("franka_empty", "rigid_pick_place", "rigid_cube_lift")
+ISAAC_SCENE_IDS = (
+    "franka_empty",
+    "rigid_pick_place",
+    "rigid_cube_lift",
+    "l_table_basket",
+)
 VISUAL_STYLES = (
     "baseline",
     "pbr_studio",
@@ -779,6 +784,63 @@ def _rigid_cube_lift_geometry(work_surface_height_m: float) -> dict[str, object]
     return geometry
 
 
+L_TABLE_BASKET_SCENE_PRIM = "/World/LTableScene"
+L_TABLE_BASKET_ASSET_ROOT_PRIM = "/World"
+L_TABLE_BASKET_DEACTIVATE_PRIM_NAMES = ("FrankaLeft",)
+L_TABLE_BASKET_TABLE_TOP_M = 0.780
+L_TABLE_BASKET_FRANKA_BASE_M = (-0.2, -0.2, 0.802)
+L_TABLE_BASKET_BASKET_INTERIOR_X_M = (-0.178, 0.138)
+L_TABLE_BASKET_BASKET_INTERIOR_Y_M = (0.212, 0.468)
+L_TABLE_BASKET_BASKET_FLOOR_Z_M = 0.792
+L_TABLE_BASKET_BASKET_RIM_Z_M = 0.900
+L_TABLE_BASKET_FIXTURE_PRIM_NAMES = (
+    "WorktopA119",
+    "WorktopB129",
+    "MountPlate141",
+    "FixtureBasketBottom",
+    "FixtureBasketSideX1",
+    "FixtureBasketSideXMinus1",
+    "FixtureBasketSideY1",
+    "FixtureBasketSideYMinus1",
+)
+
+
+def _l_table_basket_geometry(scene_usd: Path) -> dict[str, object]:
+    """Return the L-table place-in-basket scene, whose fixtures come from a task USD."""
+    usd_path = Path(scene_usd).expanduser()
+    if not usd_path.is_file():
+        raise ValueError(f"l_table_basket scene USD does not exist: {usd_path}")
+    interior_x = L_TABLE_BASKET_BASKET_INTERIOR_X_M
+    interior_y = L_TABLE_BASKET_BASKET_INTERIOR_Y_M
+    center_x = 0.5 * (interior_x[0] + interior_x[1])
+    center_y = 0.5 * (interior_y[0] + interior_y[1])
+    return {
+        "scene_usd_path": str(usd_path.resolve()),
+        "scene_prim_path": L_TABLE_BASKET_SCENE_PRIM,
+        "asset_root_prim_path": L_TABLE_BASKET_ASSET_ROOT_PRIM,
+        "deactivate_prim_names": L_TABLE_BASKET_DEACTIVATE_PRIM_NAMES,
+        "franka_base_m": L_TABLE_BASKET_FRANKA_BASE_M,
+        "work_surface_top_m": L_TABLE_BASKET_TABLE_TOP_M,
+        "task_center_xy_m": (center_x, center_y),
+        "stream_camera_target_m": (
+            center_x,
+            center_y,
+            L_TABLE_BASKET_BASKET_RIM_Z_M + 0.05,
+        ),
+        "required_prims": tuple(
+            f"{L_TABLE_BASKET_SCENE_PRIM}/{name}"
+            for name in L_TABLE_BASKET_FIXTURE_PRIM_NAMES
+        ),
+        "basket_interior_m": {
+            "x": interior_x,
+            "y": interior_y,
+            "floor_z": L_TABLE_BASKET_BASKET_FLOOR_Z_M,
+            "rim_z": L_TABLE_BASKET_BASKET_RIM_Z_M,
+        },
+        "task_instruction": "Teleoperate the Franka over the L-table place-in-basket scene",
+    }
+
+
 @dataclass
 class CubeLiftEvaluator:
     """Dataset-rate evaluator for the fixed grasp-lift-hold-release pilot."""
@@ -1167,13 +1229,57 @@ def _missing_scene_prims(
 
 def _required_scene_prims(scene_geometry: dict[str, object] | None) -> tuple[str, ...]:
     """Return only the USD prims declared by the selected scene geometry."""
-    required = STREAM_SCENE_PRIMS
     if scene_geometry is None:
-        return required
-    required += ("/World/WorkSurface", "/World/TaskObject")
+        return STREAM_SCENE_PRIMS
+    if "required_prims" in scene_geometry:
+        return STREAM_SCENE_PRIMS + tuple(scene_geometry["required_prims"])
+    required = STREAM_SCENE_PRIMS + ("/World/WorkSurface", "/World/TaskObject")
     if "target_size_m" in scene_geometry:
         required += ("/World/TargetZone",)
     return required
+
+
+def _reference_scene_asset(scene_geometry: dict[str, object]) -> dict[str, object]:
+    """Reference a fixture USD into the streamed scene and disable the robot it ships.
+
+    The fixture assets carry no USD default prim, so the reference names the asset's
+    root prim explicitly instead of letting ``UsdFileCfg`` resolve one.
+    """
+    import omni.usd
+
+    usd_path = str(scene_geometry["scene_usd_path"])
+    scene_prim_path = str(scene_geometry["scene_prim_path"])
+    asset_root_prim_path = str(scene_geometry["asset_root_prim_path"])
+    stage = omni.usd.get_context().get_stage()
+    if stage is None:
+        raise RuntimeError("scene asset reference has no active USD stage")
+    scene_prim = stage.DefinePrim(scene_prim_path, "Xform")
+    if not scene_prim.GetReferences().AddReference(usd_path, asset_root_prim_path):
+        raise RuntimeError(
+            f"failed to reference {asset_root_prim_path} of {usd_path} at {scene_prim_path}"
+        )
+    deactivated: list[str] = []
+    for name in scene_geometry.get("deactivate_prim_names", ()):
+        target_path = f"{scene_prim_path}/{name}"
+        target = stage.GetPrimAtPath(target_path)
+        if not target.IsValid():
+            raise RuntimeError(f"scene asset {usd_path} has no prim {target_path}")
+        target.SetActive(False)
+        deactivated.append(target_path)
+    missing = [
+        prim_path
+        for prim_path in scene_geometry.get("required_prims", ())
+        if not stage.GetPrimAtPath(prim_path).IsValid()
+    ]
+    if missing:
+        raise RuntimeError(f"scene asset {usd_path} is missing fixture prims: {missing}")
+    return {
+        "usd_path": usd_path,
+        "scene_prim_path": scene_prim_path,
+        "asset_root_prim_path": asset_root_prim_path,
+        "deactivated_prim_paths": deactivated,
+        "verified_fixture_prim_count": len(scene_geometry.get("required_prims", ())),
+    }
 
 
 def _configure_stream_view(
@@ -1872,6 +1978,12 @@ def _parse_args() -> tuple[argparse.Namespace, object]:
     parser.add_argument("--seed", type=int, default=0, help="episode and simulator random seed")
     parser.add_argument("--scene", default="franka_empty", choices=ISAAC_SCENE_IDS, help="scene plugin id")
     parser.add_argument(
+        "--scene-usd",
+        type=Path,
+        default=None,
+        help="fixture USD entrypoint for scenes whose geometry comes from an asset",
+    )
+    parser.add_argument(
         "--work-surface-height-m",
         type=float,
         default=DEFAULT_WORK_SURFACE_HEIGHT_M,
@@ -2293,6 +2405,10 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
         scene_geometry = _rigid_pick_place_geometry(args.work_surface_height_m)
     elif args.scene == "rigid_cube_lift":
         scene_geometry = _rigid_cube_lift_geometry(args.work_surface_height_m)
+    elif args.scene == "l_table_basket":
+        if args.scene_usd is None:
+            raise ValueError("--scene l_table_basket requires --scene-usd")
+        scene_geometry = _l_table_basket_geometry(args.scene_usd)
     else:
         scene_geometry = None
     work_surface_top_m = (
@@ -2301,9 +2417,13 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
         else None
     )
     stream_camera_target = (
-        (0.45, 0.0, work_surface_top_m + 0.15)
-        if work_surface_top_m is not None
-        else STREAM_CAMERA_TARGET
+        tuple(scene_geometry["stream_camera_target_m"])
+        if scene_geometry is not None and "stream_camera_target_m" in scene_geometry
+        else (
+            (0.45, 0.0, work_surface_top_m + 0.15)
+            if work_surface_top_m is not None
+            else STREAM_CAMERA_TARGET
+        )
     )
     task_object: object | None = None
     if pbr_studio:
@@ -2347,7 +2467,11 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                 panel_cfg,
                 translation=translation,
             )
-    if scene_geometry is not None:
+    scene_asset_status: dict[str, object] | None = None
+    if scene_geometry is not None and "scene_usd_path" in scene_geometry:
+        scene_asset_status = _reference_scene_asset(scene_geometry)
+    # Asset-backed scenes bring their own fixtures, so they spawn no cuboid task object.
+    if scene_geometry is not None and "object_start_m" in scene_geometry:
         work_surface_cfg = sim_utils.CuboidCfg(
             size=scene_geometry["work_surface_size_m"],
             collision_props=(
@@ -2417,7 +2541,11 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
         )
         task_object = RigidObject(cfg=object_cfg)
 
-    def franka_cfg(prim_path: str, layout: dict[str, object] | None = None):
+    def franka_cfg(
+        prim_path: str,
+        layout: dict[str, object] | None = None,
+        init_pos: tuple[float, float, float] | None = None,
+    ):
         cfg = FRANKA_PANDA_HIGH_PD_CFG.replace(prim_path=prim_path)
         if args.franka_usd:
             cfg.spawn.usd_path = args.franka_usd
@@ -2438,13 +2566,21 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                 collision_enabled=False
             )
             cfg.spawn.articulation_props.enabled_self_collisions = False
+        if init_pos is not None:
+            cfg.init_state.pos = tuple(init_pos)
         return cfg
 
     robot_layout = args.visual_robot_layout or {}
+    franka_init_pos = (
+        tuple(scene_geometry["franka_base_m"])
+        if scene_geometry is not None and "franka_base_m" in scene_geometry
+        else None
+    )
     robot = Articulation(
         cfg=franka_cfg(
             "/World/Franka",
             robot_layout.get("left") if dual_franka_tabletop else None,
+            init_pos=franka_init_pos,
         )
     )
     robot_right = (
@@ -2469,9 +2605,13 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
             profile,
             work_surface_top_m=work_surface_top_m,
             task_center_xy=(
-                (0.65, 0.0)
-                if dual_franka_tabletop
-                else ((0.55, -0.10) if usd_workstation else (0.45, 0.0))
+                tuple(scene_geometry["task_center_xy_m"])
+                if scene_geometry is not None and "task_center_xy_m" in scene_geometry
+                else (
+                    (0.65, 0.0)
+                    if dual_franka_tabletop
+                    else ((0.55, -0.10) if usd_workstation else (0.45, 0.0))
+                )
             ),
             preserve_authored_targets=dual_franka_tabletop,
         )
@@ -2764,6 +2904,8 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
             camera_target=stream_camera_target,
             required_prims=_required_scene_prims(scene_geometry),
         )
+        if scene_asset_status is not None:
+            scene_status = {**scene_status, "scene_asset": scene_asset_status}
         # Publish the newly-bound camera and populated stage before accepting a browser client.
         _pump_kit_frame(simulation_app)
         print(f"ISAAC_SCENE_READY {json.dumps(scene_status, sort_keys=True)}", file=sys.__stderr__, flush=True)
