@@ -49,6 +49,13 @@ ISAAC_SCENE_IDS = (
     "rigid_cube_lift",
     "l_table_basket",
 )
+PHYSICS_BACKENDS = ("physx", "newton")
+# "mjwarp" is rigid-only and runs any scene. "coupled-vbd" adds the deformable
+# soft solver, which requires the scene to actually contain a deformable body.
+NEWTON_SOLVERS = ("mjwarp", "coupled-vbd")
+# Every shipped Kit experience lists these under app.extensions.excluded, so the
+# Newton solver and its Warp runtime are absent unless they are enabled at runtime.
+NEWTON_REQUIRED_EXTENSIONS = ("omni.warp.core", "isaacsim.pip.newton")
 VISUAL_STYLES = (
     "baseline",
     "pbr_studio",
@@ -2008,6 +2015,24 @@ def _parse_args() -> tuple[argparse.Namespace, object]:
         help="physical GPU index from nvidia-smi; configures simulation, PhysX, and RTX together",
     )
     parser.add_argument("--physics_hz", type=float, default=120.0, help="physics frequency [Hz]")
+    parser.add_argument(
+        "--physics-backend",
+        choices=PHYSICS_BACKENDS,
+        default="physx",
+        help="solver driving the scene; 'newton' runs MJWarp+VBD with Isaac Sim rendering",
+    )
+    parser.add_argument(
+        "--newton-solver",
+        choices=NEWTON_SOLVERS,
+        default="mjwarp",
+        help="Newton solver; 'coupled-vbd' requires a deformable body in the scene",
+    )
+    parser.add_argument(
+        "--newton-cuda-graph",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="capture the Newton solver step in a CUDA graph; newton backend only",
+    )
     parser.add_argument("--control_hz", type=float, default=20.0, help="teleoperation control frequency [Hz]")
     parser.add_argument(
         "--keyboard-position-step-m",
@@ -2259,6 +2284,75 @@ def _parse_args() -> tuple[argparse.Namespace, object]:
     return args, app_launcher.app
 
 
+def _enable_newton_extensions() -> None:
+    """Enable the Newton solver runtime that the shipped Kit experiences exclude."""
+    import omni.kit.app
+
+    extension_manager = omni.kit.app.get_app().get_extension_manager()
+    for extension_id in NEWTON_REQUIRED_EXTENSIONS:
+        extension_manager.set_extension_enabled_immediate(extension_id, True)
+    try:
+        import newton  # noqa: F401
+    except ImportError as exc:
+        raise RuntimeError(
+            "Newton physics backend requested, but the solver runtime did not load; "
+            f"Kit extensions {NEWTON_REQUIRED_EXTENSIONS!r} must be enableable"
+        ) from exc
+
+
+def _newton_physics_cfg(solver: str, use_cuda_graph: bool) -> Any:
+    """Build the Newton solver config behind `--physics-backend newton`."""
+    from isaaclab_newton.physics import MJWarpSolverCfg, NewtonCfg
+
+    rigid_solver_cfg = MJWarpSolverCfg(
+        njmax=40,
+        nconmax=20,
+        ls_iterations=20,
+        cone="pyramidal",
+        impratio=1,
+        ls_parallel=False,
+        integrator="implicitfast",
+        ccd_iterations=100,
+    )
+    if solver == "mjwarp":
+        return NewtonCfg(
+            solver_cfg=rigid_solver_cfg,
+            num_substeps=10,
+            use_cuda_graph=use_cuda_graph,
+        )
+
+    from isaaclab.utils.configclass import configclass
+    from isaaclab_contrib.deformable.newton_manager_cfg import (
+        CoupledMJWarpVBDSolverCfg,
+        NewtonModelCfg,
+        VBDSolverCfg,
+    )
+
+    @configclass
+    class _NewtonPhysicsCfg(NewtonCfg):
+        # The base NewtonCfg carries no model_cfg field; the deformable solver reads it.
+        model_cfg: NewtonModelCfg | None = None
+
+    return _NewtonPhysicsCfg(
+        solver_cfg=CoupledMJWarpVBDSolverCfg(
+            rigid_solver_cfg=rigid_solver_cfg,
+            soft_solver_cfg=VBDSolverCfg(
+                iterations=10,
+                integrate_with_external_rigid_solver=True,
+                particle_enable_self_contact=False,
+            ),
+            coupling_mode="two_way",
+        ),
+        model_cfg=NewtonModelCfg(
+            soft_contact_ke=1e3,
+            soft_contact_kd=1e-5,
+            soft_contact_mu=0.5,
+        ),
+        num_substeps=10,
+        use_cuda_graph=use_cuda_graph,
+    )
+
+
 def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
     import importlib.metadata
 
@@ -2311,6 +2405,24 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
         and args.visual_asset.get("recorded_visual_pose_file") is not None
         else None
     )
+    newton_physics = None
+    if args.physics_backend == "newton":
+        _enable_newton_extensions()
+        newton_physics = _newton_physics_cfg(args.newton_solver, args.newton_cuda_graph)
+        print(
+            "ISAAC_PHYSICS_BACKEND "
+            + json.dumps(
+                {
+                    "backend": "newton",
+                    "solver": args.newton_solver,
+                    "cuda_graph": bool(args.newton_cuda_graph),
+                },
+                sort_keys=True,
+            ),
+            file=sys.__stderr__,
+            flush=True,
+        )
+    physics_kwargs = {} if newton_physics is None else {"physics": newton_physics}
     sim = sim_utils.SimulationContext(
         sim_utils.SimulationCfg(
             dt=sim_dt,
@@ -2318,6 +2430,7 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
             # Offline path-traced inspection needs USD transforms to reflect the
             # recorded static joint pose. Fabric remains enabled everywhere else.
             use_fabric=not dual_franka_tabletop,
+            **physics_kwargs,
         )
     )
     if dual_franka_tabletop:
