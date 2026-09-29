@@ -11,6 +11,7 @@ from typing import Any
 
 import numpy as np
 
+from .genesis_worker import parse_scene_params
 from .openpi_policy import (
     decode_policy_action,
     encode_policy_state,
@@ -300,12 +301,7 @@ def parse_args() -> argparse.Namespace:
     ) <= 0:
         parser.error("rollout, timing, image, and stability values must be positive")
     try:
-        args.scene_overrides = {}
-        for value in args.scene_param:
-            key, raw = value.split("=", 1)
-            if not key or key in args.scene_overrides:
-                raise ValueError(f"invalid or repeated scene parameter: {key!r}")
-            args.scene_overrides[key] = float(raw)
+        args.scene_overrides = parse_scene_params(args.scene_param)
         apply_scene_overrides(args.scene, args.scene_overrides)
         validate_control_timing(args.control_fps, args.sim_dt, args.physics_steps_per_control)
         args.camera_profile = load_camera_profile(

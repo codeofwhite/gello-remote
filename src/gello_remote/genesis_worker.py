@@ -87,8 +87,13 @@ def control_message_allowed(control_source: str, message_type: str) -> bool:
     raise ValueError(f"Unknown control source: {control_source}")
 
 
-def parse_scene_params(values: list[str]) -> dict[str, float]:
-    overrides: dict[str, float] = {}
+def parse_scene_params(values: list[str]) -> dict[str, float | str]:
+    """Scene overrides from KEY=VALUE flags. Numeric when it parses, else a string.
+
+    Categorical parameters (a garment id, say) cannot be floats; the scene plugin
+    is what rejects a value that is neither.
+    """
+    overrides: dict[str, float | str] = {}
     for value in values:
         if "=" not in value:
             raise ValueError(f"Scene parameter must use key=value syntax: {value!r}")
@@ -98,15 +103,23 @@ def parse_scene_params(values: list[str]) -> dict[str, float]:
             raise ValueError(f"Scene parameter key is empty or repeated: {key!r}")
         try:
             overrides[key] = float(raw)
-        except ValueError as error:
-            raise ValueError(f"Scene parameter {key!r} must be numeric") from error
+        except ValueError:
+            text = raw.strip()
+            if not text:
+                raise ValueError(f"Scene parameter {key!r} must not be empty") from None
+            overrides[key] = text
     return overrides
+
+
+def render_scene_param(key: str, value: float | str) -> str:
+    """One `--scene-param` argument, formatted by the value's own type."""
+    return f"{key}={value:.12g}" if isinstance(value, (int, float)) else f"{key}={value}"
 
 
 def build_restart_argv(
     args: argparse.Namespace,
     scene_id: str,
-    overrides: dict[str, float],
+    overrides: dict[str, float | str],
 ) -> list[str]:
     """Build a shell-free, whitelist-only argv for apply-and-restart."""
     argv = [sys.executable, "-m", args.launch_module]
@@ -149,7 +162,7 @@ def build_restart_argv(
     if getattr(args, "camera_profile_file", None) is not None:
         argv += ["--camera-profile-file", str(args.camera_profile_file)]
     for key in sorted(overrides):
-        argv += ["--scene-param", f"{key}={overrides[key]:.12g}"]
+        argv += ["--scene-param", render_scene_param(key, overrides[key])]
     return argv
 
 
