@@ -810,6 +810,21 @@ L_TABLE_BASKET_FIXTURE_PRIM_NAMES = (
     "FixtureBasketSideY1",
     "FixtureBasketSideYMinus1",
 )
+# WorktopA119 spans x [-0.7, 0.7], y [0.1, 0.7] with its top face at
+# L_TABLE_BASKET_TABLE_TOP_M, and the basket occupies x [-0.178, 0.138],
+# y [0.212, 0.468]. The cloth is parked on the clear stretch of that surface,
+# level with the basket and to the robot's left, so a teleoperated Franka can
+# reach it without having to cross the basket.
+CLOTH_PRIM_PATH = "/World/Cloth"
+CLOTH_SIZE_M = 0.25
+CLOTH_RESOLUTION = 32
+# Must stay clearly above the colliders' 0.02 m contact offset: dropped from
+# within it, the cloth reaches resting contact on the very first step with zero
+# velocity, PhysX deactivates it, and it stays frozen at its authored pose for
+# the whole episode.
+CLOTH_DROP_HEIGHT_M = 0.05
+CLOTH_TABLE_X_M = -0.42
+CLOTH_TABLE_Y_M = 0.38
 
 
 def _l_table_basket_geometry(scene_usd: Path) -> dict[str, object]:
@@ -845,7 +860,47 @@ def _l_table_basket_geometry(scene_usd: Path) -> dict[str, object]:
             "rim_z": L_TABLE_BASKET_BASKET_RIM_Z_M,
         },
         "task_instruction": "Teleoperate the Franka over the L-table place-in-basket scene",
+        "cloth_start_m": (
+            CLOTH_TABLE_X_M,
+            CLOTH_TABLE_Y_M,
+            L_TABLE_BASKET_TABLE_TOP_M + CLOTH_DROP_HEIGHT_M,
+        ),
     }
+
+
+def _spawn_l_table_cloth(scene_geometry: dict[str, object]) -> object:
+    """Spawn the worktop cloth as a PhysX surface deformable."""
+    import isaaclab.sim as sim_utils
+    from isaaclab.assets import DeformableObject, DeformableObjectCfg
+    from isaaclab_physx.sim import (
+        PhysxDeformableBodyPropertiesCfg,
+        PhysxSurfaceDeformableBodyMaterialCfg,
+    )
+
+    return DeformableObject(
+        cfg=DeformableObjectCfg(
+            prim_path=CLOTH_PRIM_PATH,
+            spawn=sim_utils.MeshRectangleCfg(
+                size=(CLOTH_SIZE_M, CLOTH_SIZE_M),
+                resolution=(CLOTH_RESOLUTION, CLOTH_RESOLUTION),
+                deformable_props=PhysxDeformableBodyPropertiesCfg(),
+                physics_material=PhysxSurfaceDeformableBodyMaterialCfg(
+                    density=300.0,
+                    youngs_modulus=8e4,
+                    poissons_ratio=0.25,
+                    static_friction=10.0,
+                    dynamic_friction=5.0,
+                    surface_thickness=0.003,
+                ),
+                visual_material=sim_utils.PreviewSurfaceCfg(
+                    diffuse_color=(0.90, 0.88, 0.80)
+                ),
+            ),
+            init_state=DeformableObjectCfg.InitialStateCfg(
+                pos=tuple(scene_geometry["cloth_start_m"])
+            ),
+        )
+    )
 
 
 @dataclass
@@ -2033,6 +2088,12 @@ def _parse_args() -> tuple[argparse.Namespace, object]:
         default=True,
         help="capture the Newton solver step in a CUDA graph; newton backend only",
     )
+    parser.add_argument(
+        "--cloth",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="spawn a simulated cloth on the worktop; scenes that provide cloth_start_m only",
+    )
     parser.add_argument("--control_hz", type=float, default=20.0, help="teleoperation control frequency [Hz]")
     parser.add_argument(
         "--keyboard-position-step-m",
@@ -2706,6 +2767,36 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
         if dual_franka_tabletop
         else None
     )
+    cloth_object = None
+    if args.cloth and scene_geometry is not None and "cloth_start_m" in scene_geometry:
+        # The Newton backend has no surface-deformable support here, but switching
+        # backends must not take the whole scene down with it: skip the cloth and
+        # say so rather than refusing to start.
+        if args.physics_backend != "physx":
+            print(
+                "ISAAC_CLOTH_SKIPPED "
+                + json.dumps({"reason": "cloth is physx-only", "backend": args.physics_backend}),
+                file=sys.__stderr__,
+                flush=True,
+            )
+            cloth_object = None
+        else:
+            cloth_object = _spawn_l_table_cloth(scene_geometry)
+    if cloth_object is not None:
+        print(
+            "ISAAC_CLOTH "
+            + json.dumps(
+                {
+                    "prim_path": CLOTH_PRIM_PATH,
+                    "size_m": CLOTH_SIZE_M,
+                    "resolution": CLOTH_RESOLUTION,
+                    "start_m": list(scene_geometry["cloth_start_m"]),
+                },
+                sort_keys=True,
+            ),
+            file=sys.__stderr__,
+            flush=True,
+        )
     record_cameras: dict[str, object] = {}
     camera_prim_paths: dict[str, str] = {}
     camera_intrinsic_sources: dict[str, str] = {}
@@ -3015,7 +3106,10 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
     if args.smoke_steps == 0:
         scene_status = _configure_stream_view(
             camera_target=stream_camera_target,
-            required_prims=_required_scene_prims(scene_geometry),
+            required_prims=(
+                _required_scene_prims(scene_geometry)
+                + ((CLOTH_PRIM_PATH,) if cloth_object is not None else ())
+            ),
         )
         if scene_asset_status is not None:
             scene_status = {**scene_status, "scene_asset": scene_asset_status}
@@ -3666,6 +3760,8 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                         sim.step()
                         robot.update(sim_dt)
                         task_object.update(sim_dt)
+                        if cloth_object is not None:
+                            cloth_object.update(sim_dt)
                         _pump_kit_frame(simulation_app)
                     cube_lift_evaluator.update(
                         object_z_m=float(task_object.data.root_pos_w.torch[0, 2].item()),
@@ -4072,6 +4168,8 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                     sim.step()
                     robot.update(sim_dt)
                     task_object.update(sim_dt)
+                    if cloth_object is not None:
+                        cloth_object.update(sim_dt)
                     _pump_kit_frame(simulation_app)
 
                 post_object_z = float(task_object.data.root_pos_w.torch[0, 2].item())
@@ -4551,6 +4649,10 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                 robot_right.update(sim_dt)
             if task_object is not None:
                 task_object.update(sim_dt)
+            if cloth_object is not None:
+                # DeformableObjectData only re-reads the PhysX buffers once its
+                # timestamp is advanced, so this is what makes cloth state live.
+                cloth_object.update(sim_dt)
             if args.smoke_steps == 0 and physics_step % stream_decimation == 0:
                 _pump_kit_frame(simulation_app)
             actual_joint_positions = backend.current_joint_positions()
@@ -4690,6 +4792,15 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
             "watchdog_holds": controller_status["watchdog_holds"],
             "target_held_after_watchdog": target_held,
         }
+        if cloth_object is not None:
+            cloth_z = cloth_object.data.nodal_pos_w.torch[..., 2]
+            report["cloth"] = {
+                "spawn_z_m": L_TABLE_BASKET_TABLE_TOP_M + CLOTH_DROP_HEIGHT_M,
+                "final_z_min_m": float(cloth_z.min().item()),
+                "final_z_max_m": float(cloth_z.max().item()),
+                "final_z_mean_m": float(cloth_z.mean().item()),
+                "num_nodes": int(cloth_z.shape[1]),
+            }
         print(
             f"GELLO_ISAAC_SMOKE {json.dumps(report, sort_keys=True)}",
             file=sys.__stderr__,
