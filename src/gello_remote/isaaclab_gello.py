@@ -842,6 +842,13 @@ NEWTON_CLOTH_EDGE_KD = 1e-3
 # velocity, PhysX deactivates it, and it stays frozen at its authored pose for
 # the whole episode.
 CLOTH_DROP_HEIGHT_M = 0.05
+# WorktopA119 spans x [-0.700, 0.700], y [0.100, 0.700] with its top face at
+# L_TABLE_BASKET_TABLE_TOP_M, and the basket occupies x [-0.178, 0.138],
+# y [0.212, 0.468]. The cloth starts on the clear stretch of that surface, level
+# with the basket and to the robot's left, so the arm can reach it without having
+# to cross the basket first.
+CLOTH_TABLE_X_M = -0.42
+CLOTH_TABLE_Y_M = 0.38
 # MJWarp's implicit drive leaves the PD steady-state error in place, so the arm sags by
 # gravity/stiffness: 0.0559 rad at the shipped Franka gains, which is 3.5 cm at the end
 # effector and swamps every 1 cm keyboard step. PhysX solves the same error out (1e-4).
@@ -860,6 +867,10 @@ def _l_table_basket_geometry(scene_usd: Path) -> dict[str, object]:
     interior_y = L_TABLE_BASKET_BASKET_INTERIOR_Y_M
     center_x = 0.5 * (interior_x[0] + interior_x[1])
     center_y = 0.5 * (interior_y[0] + interior_y[1])
+    # Frame the whole reach: half way between where the cloth starts and where it has
+    # to end up, so both ends of the pick-and-place stay in view.
+    task_x = 0.5 * (CLOTH_TABLE_X_M + center_x)
+    task_y = 0.5 * (CLOTH_TABLE_Y_M + center_y)
     return {
         "scene_usd_path": str(usd_path.resolve()),
         "scene_prim_path": L_TABLE_BASKET_SCENE_PRIM,
@@ -867,10 +878,10 @@ def _l_table_basket_geometry(scene_usd: Path) -> dict[str, object]:
         "deactivate_prim_names": L_TABLE_BASKET_DEACTIVATE_PRIM_NAMES,
         "franka_base_m": L_TABLE_BASKET_FRANKA_BASE_M,
         "work_surface_top_m": L_TABLE_BASKET_TABLE_TOP_M,
-        "task_center_xy_m": (center_x, center_y),
+        "task_center_xy_m": (task_x, task_y),
         "stream_camera_target_m": (
-            center_x,
-            center_y,
+            task_x,
+            task_y,
             L_TABLE_BASKET_BASKET_RIM_Z_M + 0.05,
         ),
         "stream_camera_eye_m": L_TABLE_BASKET_BASE_CAMERA_EYE_M,
@@ -884,13 +895,16 @@ def _l_table_basket_geometry(scene_usd: Path) -> dict[str, object]:
             "floor_z": L_TABLE_BASKET_BASKET_FLOOR_Z_M,
             "rim_z": L_TABLE_BASKET_BASKET_RIM_Z_M,
         },
-        "task_instruction": "Teleoperate the Franka over the L-table place-in-basket scene",
-        # The cloth is dropped into the basket interior, clearing the rim, so the
-        # task object is unambiguous in every camera view.
+        "task_instruction": (
+            "Teleoperate the Franka to pick the cloth off the L-table worktop"
+            " and place it in the basket"
+        ),
+        # The cloth starts on the worktop, so this is a pick-and-place: the arm has to
+        # grasp it and carry it over to the basket.
         "cloth_start_m": (
-            center_x,
-            center_y,
-            L_TABLE_BASKET_BASKET_RIM_Z_M + CLOTH_DROP_HEIGHT_M,
+            CLOTH_TABLE_X_M,
+            CLOTH_TABLE_Y_M,
+            L_TABLE_BASKET_TABLE_TOP_M + CLOTH_DROP_HEIGHT_M,
         ),
     }
 
