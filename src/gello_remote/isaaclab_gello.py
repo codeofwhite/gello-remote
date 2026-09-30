@@ -826,6 +826,17 @@ L_TABLE_BASKET_BASE_CAMERA_EYE_M = (1.30, 0.55, 1.60)
 CLOTH_PRIM_PATH = "/World/Cloth"
 CLOTH_SIZE_M = 0.25
 CLOTH_RESOLUTION = 32
+# Newton's cloth parameters are consumed by Newton's own `add_cloth_mesh`, not by
+# PhysX, and the Newton reader requires a physics material carrying a
+# `newton:density` attribute. Sizes follow the shipped reference environment
+# isaaclab_tasks/.../manipulation/lift_franka_soft/franka_cloth_env_cfg.py.
+NEWTON_CLOTH_DENSITY = 50.0
+NEWTON_CLOTH_PARTICLE_RADIUS_M = 0.005
+NEWTON_CLOTH_TRI_KE = 5e2
+NEWTON_CLOTH_TRI_KA = 5e2
+NEWTON_CLOTH_TRI_KD = 1e-3
+NEWTON_CLOTH_EDGE_KE = 2.0
+NEWTON_CLOTH_EDGE_KD = 1e-3
 # Must stay clearly above the colliders' 0.02 m contact offset: dropped from
 # within it, the cloth reaches resting contact on the very first step with zero
 # velocity, PhysX deactivates it, and it stays frozen at its authored pose for
@@ -877,14 +888,52 @@ def _l_table_basket_geometry(scene_usd: Path) -> dict[str, object]:
     }
 
 
-def _spawn_l_table_cloth(scene_geometry: dict[str, object]) -> object:
-    """Spawn the worktop cloth as a PhysX surface deformable."""
+def _spawn_l_table_cloth(
+    scene_geometry: dict[str, object], backend: str = "physx"
+) -> object:
+    """Spawn the worktop cloth as a surface deformable on the given physics backend.
+
+    The two backends take different asset classes and different spawn cfgs: PhysX
+    reads its own properties/material schemas, while Newton's reader wants a
+    `MaterialBindingAPI` bound to a material carrying `newton:density`, so the
+    PhysX cfgs cannot be reused there.
+    """
     import isaaclab.sim as sim_utils
-    from isaaclab.assets import DeformableObject, DeformableObjectCfg
-    from isaaclab_physx.sim import (
-        PhysxDeformableBodyPropertiesCfg,
-        PhysxSurfaceDeformableBodyMaterialCfg,
-    )
+    from isaaclab.assets import DeformableObjectCfg
+
+    if backend == "physx":
+        from isaaclab.assets import DeformableObject
+        from isaaclab_physx.sim import (
+            PhysxDeformableBodyPropertiesCfg,
+            PhysxSurfaceDeformableBodyMaterialCfg,
+        )
+
+        deformable_props = PhysxDeformableBodyPropertiesCfg()
+        physics_material = PhysxSurfaceDeformableBodyMaterialCfg(
+            density=300.0,
+            youngs_modulus=8e4,
+            poissons_ratio=0.25,
+            static_friction=10.0,
+            dynamic_friction=5.0,
+            surface_thickness=0.003,
+        )
+    else:
+        from isaaclab_newton.assets import DeformableObject
+        from isaaclab_newton.sim.schemas import NewtonDeformableBodyPropertiesCfg
+        from isaaclab_newton.sim.spawners.materials import (
+            NewtonSurfaceDeformableBodyMaterialCfg,
+        )
+
+        deformable_props = NewtonDeformableBodyPropertiesCfg()
+        physics_material = NewtonSurfaceDeformableBodyMaterialCfg(
+            density=NEWTON_CLOTH_DENSITY,
+            particle_radius=NEWTON_CLOTH_PARTICLE_RADIUS_M,
+            tri_ke=NEWTON_CLOTH_TRI_KE,
+            tri_ka=NEWTON_CLOTH_TRI_KA,
+            tri_kd=NEWTON_CLOTH_TRI_KD,
+            edge_ke=NEWTON_CLOTH_EDGE_KE,
+            edge_kd=NEWTON_CLOTH_EDGE_KD,
+        )
 
     return DeformableObject(
         cfg=DeformableObjectCfg(
@@ -892,15 +941,8 @@ def _spawn_l_table_cloth(scene_geometry: dict[str, object]) -> object:
             spawn=sim_utils.MeshRectangleCfg(
                 size=(CLOTH_SIZE_M, CLOTH_SIZE_M),
                 resolution=(CLOTH_RESOLUTION, CLOTH_RESOLUTION),
-                deformable_props=PhysxDeformableBodyPropertiesCfg(),
-                physics_material=PhysxSurfaceDeformableBodyMaterialCfg(
-                    density=300.0,
-                    youngs_modulus=8e4,
-                    poissons_ratio=0.25,
-                    static_friction=10.0,
-                    dynamic_friction=5.0,
-                    surface_thickness=0.003,
-                ),
+                deformable_props=deformable_props,
+                physics_material=physics_material,
                 visual_material=sim_utils.PreviewSurfaceCfg(
                     diffuse_color=(0.90, 0.88, 0.80)
                 ),
@@ -2596,11 +2638,19 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
         scene_geometry = _l_table_basket_geometry(args.scene_usd)
     else:
         scene_geometry = None
+    # Newton only has soft bodies through the coupled VBD solver; plain mjwarp is
+    # rigid-only. Resolve this once so the cloth spawn and the decoy-cloth
+    # deactivation cannot drift apart.
+    cloth_supported = not (
+        args.physics_backend == "newton" and args.newton_solver != "coupled-vbd"
+    )
+    cloth_requested = bool(
+        args.cloth and scene_geometry is not None and "cloth_start_m" in scene_geometry
+    )
     if (
-        scene_geometry is not None
+        cloth_requested
+        and cloth_supported
         and "deactivate_prim_names" in scene_geometry
-        and args.cloth
-        and args.physics_backend == "physx"
     ):
         scene_geometry["deactivate_prim_names"] = (
             tuple(scene_geometry["deactivate_prim_names"])
@@ -2794,20 +2844,25 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
         else None
     )
     cloth_object = None
-    if args.cloth and scene_geometry is not None and "cloth_start_m" in scene_geometry:
-        # The Newton backend has no surface-deformable support here, but switching
-        # backends must not take the whole scene down with it: skip the cloth and
-        # say so rather than refusing to start.
-        if args.physics_backend != "physx":
+    if cloth_requested:
+        # Switching backends must not take the whole scene down with it: skip the
+        # cloth and say so rather than refusing to start.
+        if not cloth_supported:
             print(
                 "ISAAC_CLOTH_SKIPPED "
-                + json.dumps({"reason": "cloth is physx-only", "backend": args.physics_backend}),
+                + json.dumps(
+                    {
+                        "reason": "newton cloth needs the coupled-vbd solver",
+                        "backend": args.physics_backend,
+                        "solver": args.newton_solver,
+                    }
+                ),
                 file=sys.__stderr__,
                 flush=True,
             )
             cloth_object = None
         else:
-            cloth_object = _spawn_l_table_cloth(scene_geometry)
+            cloth_object = _spawn_l_table_cloth(scene_geometry, args.physics_backend)
     if cloth_object is not None:
         print(
             "ISAAC_CLOTH "
