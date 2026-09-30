@@ -842,6 +842,13 @@ NEWTON_CLOTH_EDGE_KD = 1e-3
 # velocity, PhysX deactivates it, and it stays frozen at its authored pose for
 # the whole episode.
 CLOTH_DROP_HEIGHT_M = 0.05
+# MJWarp's implicit drive leaves the PD steady-state error in place, so the arm sags by
+# gravity/stiffness: 0.0559 rad at the shipped Franka gains, which is 3.5 cm at the end
+# effector and swamps every 1 cm keyboard step. PhysX solves the same error out (1e-4).
+# MuJoCo's gravcomp would remove it, but those `mjc:` attributes are only consumed by
+# Newton's plain MuJoCo solver, not by the MJWarp solver this backend runs, so raising
+# the gains is the available lever. Measured: x5 -> 0.0111 rad, x20 -> 0.0027 rad.
+NEWTON_ARM_GAIN_SCALE = 20.0
 
 
 def _l_table_basket_geometry(scene_usd: Path) -> dict[str, object]:
@@ -2825,6 +2832,21 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
             cfg.spawn.articulation_props.enabled_self_collisions = False
         if init_pos is not None:
             cfg.init_state.pos = tuple(init_pos)
+        if args.physics_backend == "newton":
+            scaled: dict[str, object] = {}
+            for actuator_name, actuator in cfg.actuators.items():
+                fields = actuator.to_dict()
+                for key in ("stiffness", "damping"):
+                    value = fields.get(key)
+                    if isinstance(value, dict):
+                        fields[key] = {
+                            joint: gain * NEWTON_ARM_GAIN_SCALE
+                            for joint, gain in value.items()
+                        }
+                    elif value is not None:
+                        fields[key] = value * NEWTON_ARM_GAIN_SCALE
+                scaled[actuator_name] = type(actuator)(**fields)
+            cfg.actuators = scaled
         return cfg
 
     robot_layout = args.visual_robot_layout or {}
@@ -3173,20 +3195,43 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                 )
             ]
     if record_cameras:
-        for camera_name in (
+        posed_names = (
             BIMANUAL_VISUAL_CAMERA_NAMES[:]
             if dual_franka_tabletop
             else ("base", "top", "side")
-        ):
-            camera_override = isaac_overrides[camera_name]
-            record_cameras[camera_name].set_world_poses_from_view(
-                torch.tensor(
-                    [camera_override["eye_world_m"]], dtype=torch.float32, device=sim.device
-                ),
-                torch.tensor(
-                    [camera_override["target_world_m"]], dtype=torch.float32, device=sim.device
-                ),
-            )
+        )
+        if args.physics_backend == "newton":
+            # Newton brings up cubric's GPU transform hierarchy, which does not pick up
+            # the USD transform `set_world_poses_from_view` writes, so the sensors would
+            # render from the wrong pose. Pose them through the renderer instead. This
+            # only works before the first render, which is where this runs.
+            from isaacsim.core.rendering_manager import ViewportManager
+
+            import omni.usd
+
+            camera_stage = omni.usd.get_context().get_stage()
+            for camera_name in posed_names:
+                camera_override = isaac_overrides[camera_name]
+                ViewportManager.set_camera_view(
+                    camera_stage.GetPrimAtPath(record_cameras[camera_name].cfg.prim_path),
+                    eye=tuple(camera_override["eye_world_m"]),
+                    target=tuple(camera_override["target_world_m"]),
+                )
+        else:
+            for camera_name in posed_names:
+                camera_override = isaac_overrides[camera_name]
+                record_cameras[camera_name].set_world_poses_from_view(
+                    torch.tensor(
+                        [camera_override["eye_world_m"]],
+                        dtype=torch.float32,
+                        device=sim.device,
+                    ),
+                    torch.tensor(
+                        [camera_override["target_world_m"]],
+                        dtype=torch.float32,
+                        device=sim.device,
+                    ),
+                )
         for camera in record_cameras.values():
             camera.update(dt=sim_dt)
 
