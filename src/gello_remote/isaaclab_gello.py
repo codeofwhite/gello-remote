@@ -845,13 +845,12 @@ CLOTH_DROP_HEIGHT_M = 0.05
 # Off-white disappeared against the white worktop, which the operator has to aim the
 # gripper at by eye. Keep it clearly off both the worktop and the basket's slate blue.
 CLOTH_COLOR_RGB = (0.15, 0.40, 0.85)
-# WorktopA119 spans x [-0.700, 0.700], y [0.100, 0.700] with its top face at
-# L_TABLE_BASKET_TABLE_TOP_M, and the basket occupies x [-0.178, 0.138],
-# y [0.212, 0.468]. The cloth starts on the clear stretch of that surface, level
-# with the basket and to the robot's left, so the arm can reach it without having
-# to cross the basket first.
-CLOTH_TABLE_X_M = -0.42
-CLOTH_TABLE_Y_M = 0.38
+# WorktopB129 spans x [-0.200, 1.000], y [-1.100, 0.500]. At FRANKA_HOME the end
+# effector hovers directly above x 0.164, y -0.200, so starting the cloth there puts it
+# straight under the hand and the grasp needs almost no approach travel, while leaving
+# the basket clear on the far side of the worktop.
+CLOTH_TABLE_X_M = 0.16
+CLOTH_TABLE_Y_M = -0.20
 # MJWarp's implicit drive leaves the PD steady-state error in place, so the arm sags by
 # gravity/stiffness: 0.0559 rad at the shipped Franka gains, which is 3.5 cm at the end
 # effector and swamps every 1 cm keyboard step. PhysX solves the same error out (1e-4).
