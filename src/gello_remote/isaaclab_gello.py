@@ -810,11 +810,19 @@ L_TABLE_BASKET_FIXTURE_PRIM_NAMES = (
     "FixtureBasketSideY1",
     "FixtureBasketSideYMinus1",
 )
-# WorktopA119 spans x [-0.7, 0.7], y [0.1, 0.7] with its top face at
-# L_TABLE_BASKET_TABLE_TOP_M, and the basket occupies x [-0.178, 0.138],
-# y [0.212, 0.468]. The cloth is parked on the clear stretch of that surface,
-# level with the basket and to the robot's left, so a teleoperated Franka can
-# reach it without having to cross the basket.
+# The scene USD ships its own cotton-textured cloth as pure decoration: it carries
+# only MaterialBindingAPI, so nothing can collide with it or move it. Leaving it
+# beside a simulated cloth makes the two indistinguishable, so it is deactivated
+# whenever the simulated cloth is actually spawned.
+L_TABLE_BASKET_DECOY_CLOTH_PRIM_NAMES = (
+    "TaskCloth146",
+    "SewnHem147",
+    "TargetOutline148",
+)
+# The L-table's task centre sits at x=-0.02, but the camera profile's base eye was
+# authored for a workstation at x=0.45, which puts that eye behind the room
+# shelving with the robot entirely out of shot.
+L_TABLE_BASKET_BASE_CAMERA_EYE_M = (1.30, 0.55, 1.60)
 CLOTH_PRIM_PATH = "/World/Cloth"
 CLOTH_SIZE_M = 0.25
 CLOTH_RESOLUTION = 32
@@ -823,8 +831,6 @@ CLOTH_RESOLUTION = 32
 # velocity, PhysX deactivates it, and it stays frozen at its authored pose for
 # the whole episode.
 CLOTH_DROP_HEIGHT_M = 0.05
-CLOTH_TABLE_X_M = -0.42
-CLOTH_TABLE_Y_M = 0.38
 
 
 def _l_table_basket_geometry(scene_usd: Path) -> dict[str, object]:
@@ -849,6 +855,7 @@ def _l_table_basket_geometry(scene_usd: Path) -> dict[str, object]:
             center_y,
             L_TABLE_BASKET_BASKET_RIM_Z_M + 0.05,
         ),
+        "stream_camera_eye_m": L_TABLE_BASKET_BASE_CAMERA_EYE_M,
         "required_prims": tuple(
             f"{L_TABLE_BASKET_SCENE_PRIM}/{name}"
             for name in L_TABLE_BASKET_FIXTURE_PRIM_NAMES
@@ -860,10 +867,12 @@ def _l_table_basket_geometry(scene_usd: Path) -> dict[str, object]:
             "rim_z": L_TABLE_BASKET_BASKET_RIM_Z_M,
         },
         "task_instruction": "Teleoperate the Franka over the L-table place-in-basket scene",
+        # The cloth is dropped into the basket interior, clearing the rim, so the
+        # task object is unambiguous in every camera view.
         "cloth_start_m": (
-            CLOTH_TABLE_X_M,
-            CLOTH_TABLE_Y_M,
-            L_TABLE_BASKET_TABLE_TOP_M + CLOTH_DROP_HEIGHT_M,
+            center_x,
+            center_y,
+            L_TABLE_BASKET_BASKET_RIM_Z_M + CLOTH_DROP_HEIGHT_M,
         ),
     }
 
@@ -1347,6 +1356,7 @@ def _reference_scene_asset(scene_geometry: dict[str, object]) -> dict[str, objec
 def _configure_stream_view(
     *,
     camera_target: tuple[float, float, float] = STREAM_CAMERA_TARGET,
+    camera_eye: tuple[float, float, float] = STREAM_CAMERA_EYE,
     required_prims: tuple[str, ...] = STREAM_SCENE_PRIMS,
 ) -> dict[str, object]:
     """Validate the scene and bind the live WebRTC viewport to the Franka view."""
@@ -1371,7 +1381,7 @@ def _configure_stream_view(
     ViewportManager.set_resolution(
         (STREAM_WIDTH, STREAM_HEIGHT), render_product_or_viewport=viewport
     )
-    ViewportManager.set_camera_view(camera, eye=STREAM_CAMERA_EYE, target=camera_target)
+    ViewportManager.set_camera_view(camera, eye=camera_eye, target=camera_target)
     return {
         "scene_prims_ready": True,
         "viewport_ready": True,
@@ -1385,6 +1395,7 @@ def _set_stream_view(
     camera_prim_paths: dict[str, str],
     *,
     camera_target: tuple[float, float, float] = STREAM_CAMERA_TARGET,
+    camera_eye: tuple[float, float, float] = STREAM_CAMERA_EYE,
 ) -> str:
     """Switch the one WebRTC viewport to a free or recorded camera on the render thread."""
     from isaacsim.core.rendering_manager import ViewportManager
@@ -1397,7 +1408,7 @@ def _set_stream_view(
         ViewportManager.set_camera(camera_path, render_product_or_viewport=viewport)
         camera = ViewportManager.get_camera(viewport)
         ViewportManager.set_camera_view(
-            camera, eye=STREAM_CAMERA_EYE, target=camera_target
+            camera, eye=camera_eye, target=camera_target
         )
         return camera_path
     try:
@@ -2585,6 +2596,16 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
         scene_geometry = _l_table_basket_geometry(args.scene_usd)
     else:
         scene_geometry = None
+    if (
+        scene_geometry is not None
+        and "deactivate_prim_names" in scene_geometry
+        and args.cloth
+        and args.physics_backend == "physx"
+    ):
+        scene_geometry["deactivate_prim_names"] = (
+            tuple(scene_geometry["deactivate_prim_names"])
+            + L_TABLE_BASKET_DECOY_CLOTH_PRIM_NAMES
+        )
     work_surface_top_m = (
         float(scene_geometry["work_surface_top_m"])
         if scene_geometry is not None
@@ -2598,6 +2619,11 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
             if work_surface_top_m is not None
             else STREAM_CAMERA_TARGET
         )
+    )
+    stream_camera_eye = (
+        tuple(scene_geometry["stream_camera_eye_m"])
+        if scene_geometry is not None and "stream_camera_eye_m" in scene_geometry
+        else STREAM_CAMERA_EYE
     )
     task_object: object | None = None
     if pbr_studio:
@@ -2819,6 +2845,16 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
             ),
             preserve_authored_targets=dual_franka_tabletop,
         )
+        if (
+            scene_geometry is not None
+            and "stream_camera_eye_m" in scene_geometry
+            and not dual_franka_tabletop
+        ):
+            # _scene_camera_overrides only rewrites targets; this scene's task centre
+            # is far enough from the profile's workstation that its eye must move too.
+            isaac_overrides["base"]["eye_world_m"] = list(
+                scene_geometry["stream_camera_eye_m"]
+            )
         camera_sensor_fps = max(args.dataset_fps, args.preview_fps)
         if dual_franka_tabletop:
             camera_specs = (
@@ -3106,6 +3142,7 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
     if args.smoke_steps == 0:
         scene_status = _configure_stream_view(
             camera_target=stream_camera_target,
+            camera_eye=stream_camera_eye,
             required_prims=(
                 _required_scene_prims(scene_geometry)
                 + ((CLOTH_PRIM_PATH,) if cloth_object is not None else ())
@@ -4409,6 +4446,7 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                             view_name,
                             camera_prim_paths,
                             camera_target=stream_camera_target,
+                            camera_eye=stream_camera_eye,
                         )
                     except (RuntimeError, ValueError) as exc:
                         telemetry.update(view_error=str(exc))
