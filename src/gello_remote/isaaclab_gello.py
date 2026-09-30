@@ -2520,15 +2520,24 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
         else None
     )
     newton_physics = None
+    # The cloth only exists under the coupled solver: plain mjwarp is rigid-only. It
+    # cannot go the other way either -- the coupled solver needs particles to exist, so
+    # it must not be picked when no cloth will be spawned. `cloth_start_m` only ever
+    # comes from the L-table scene, so this is decidable before the scene geometry is
+    # resolved (that happens further down, after the sim is built).
+    newton_solver = args.newton_solver
     if args.physics_backend == "newton":
+        if args.cloth and args.scene == "l_table_basket":
+            newton_solver = "coupled-vbd"
         _enable_newton_extensions()
-        newton_physics = _newton_physics_cfg(args.newton_solver, args.newton_cuda_graph)
+        newton_physics = _newton_physics_cfg(newton_solver, args.newton_cuda_graph)
         print(
             "ISAAC_PHYSICS_BACKEND "
             + json.dumps(
                 {
                     "backend": "newton",
-                    "solver": args.newton_solver,
+                    "solver": newton_solver,
+                    "requested_solver": args.newton_solver,
                     "cuda_graph": bool(args.newton_cuda_graph),
                 },
                 sort_keys=True,
@@ -2641,9 +2650,7 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
     # Newton only has soft bodies through the coupled VBD solver; plain mjwarp is
     # rigid-only. Resolve this once so the cloth spawn and the decoy-cloth
     # deactivation cannot drift apart.
-    cloth_supported = not (
-        args.physics_backend == "newton" and args.newton_solver != "coupled-vbd"
-    )
+    cloth_supported = args.physics_backend != "newton" or newton_solver == "coupled-vbd"
     cloth_requested = bool(
         args.cloth and scene_geometry is not None and "cloth_start_m" in scene_geometry
     )
@@ -2845,24 +2852,14 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
     )
     cloth_object = None
     if cloth_requested:
-        # Switching backends must not take the whole scene down with it: skip the
-        # cloth and say so rather than refusing to start.
+        # The solver was already forced to coupled-vbd above whenever a cloth is
+        # requested, so this can only trip if that upgrade stops covering a scene
+        # that spawns one -- fail loudly instead of quietly dropping the cloth.
         if not cloth_supported:
-            print(
-                "ISAAC_CLOTH_SKIPPED "
-                + json.dumps(
-                    {
-                        "reason": "newton cloth needs the coupled-vbd solver",
-                        "backend": args.physics_backend,
-                        "solver": args.newton_solver,
-                    }
-                ),
-                file=sys.__stderr__,
-                flush=True,
+            raise RuntimeError(
+                f"cloth requested but newton solver {newton_solver!r} has no soft bodies"
             )
-            cloth_object = None
-        else:
-            cloth_object = _spawn_l_table_cloth(scene_geometry, args.physics_backend)
+        cloth_object = _spawn_l_table_cloth(scene_geometry, args.physics_backend)
     if cloth_object is not None:
         print(
             "ISAAC_CLOTH "
