@@ -842,6 +842,9 @@ NEWTON_CLOTH_EDGE_KD = 1e-3
 # velocity, PhysX deactivates it, and it stays frozen at its authored pose for
 # the whole episode.
 CLOTH_DROP_HEIGHT_M = 0.05
+# Off-white disappeared against the white worktop, which the operator has to aim the
+# gripper at by eye. Keep it clearly off both the worktop and the basket's slate blue.
+CLOTH_COLOR_RGB = (0.15, 0.40, 0.85)
 # WorktopA119 spans x [-0.700, 0.700], y [0.100, 0.700] with its top face at
 # L_TABLE_BASKET_TABLE_TOP_M, and the basket occupies x [-0.178, 0.138],
 # y [0.212, 0.468]. The cloth starts on the clear stretch of that surface, level
@@ -965,7 +968,7 @@ def _spawn_l_table_cloth(
                 deformable_props=deformable_props,
                 physics_material=physics_material,
                 visual_material=sim_utils.PreviewSurfaceCfg(
-                    diffuse_color=(0.90, 0.88, 0.80)
+                    diffuse_color=CLOTH_COLOR_RGB
                 ),
             ),
             init_state=DeformableObjectCfg.InitialStateCfg(
