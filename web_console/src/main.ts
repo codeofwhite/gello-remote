@@ -38,6 +38,10 @@ const video = byId<HTMLVideoElement>("remote-video");
 const controlSections = [...document.querySelectorAll<HTMLElement>("[data-control-source]")];
 let controlSource: "keyboard" | "gello" = "gello";
 let controlHz = 20;
+let dualArm = false;
+let keyboardSynchronized = false;
+let activeArm: "left" | "right" = "left";
+const armGrippers = { left: false, right: false };
 let keyboardHeartbeat: number | undefined;
 
 function configureControlSource(source: unknown, hz: unknown) {
@@ -75,6 +79,17 @@ async function connectStream() {
     const response = await fetch("/teleop-config.json", { cache: "no-store" });
     if (!response.ok) throw new Error(`Runtime config returned HTTP ${response.status}`);
     const runtimeConfig = await response.json();
+    dualArm = runtimeConfig.dual_arm === true;
+    byId("arm-switch-help").hidden = !dualArm;
+    if (dualArm) {
+      for (const [name, label] of [["side", "Left oblique"], ["wrist", "Right oblique"]]) {
+        const card = document.querySelector<HTMLElement>(`[data-preview-camera="${name}"]`);
+        const heading = card?.querySelector("strong");
+        if (heading) heading.textContent = label;
+        card?.setAttribute("aria-label", `Show ${label} camera in main view`);
+        byId<HTMLImageElement>(`${name}-preview-image`).alt = `${label} external camera`;
+      }
+    }
     configureControlSource(runtimeConfig.control_source, runtimeConfig.control_hz);
     const endpoint = resolveStreamConfig(runtimeConfig, window.location.search);
     streamEndpoint.textContent = `WebRTC: ${endpoint.signalingServer}:${endpoint.signalingPort} / UDP ${endpoint.mediaPort}`;
@@ -268,6 +283,7 @@ function stopControl() {
 
 function sendKeyboardState() {
   if (controlSource !== "keyboard" || socket?.readyState !== WebSocket.OPEN) return;
+  if (dualArm && !keyboardSynchronized) return;
   socket.send(JSON.stringify({
     type: "keyboard",
     version: 1,
@@ -276,6 +292,7 @@ function sendKeyboardState() {
     timestamp_ns: Date.now() * 1e6,
     pressed: [...pressedKeyboardKeys].sort(),
     gripper_closed: keyboardGripperClosed,
+    ...(dualArm ? { active_arm: activeArm } : {}),
   }));
 }
 
@@ -287,17 +304,30 @@ function clearKeyboardMotion(message: string) {
 }
 
 function editableTarget(target: EventTarget | null) {
-  return target instanceof HTMLElement && target.matches("input, select, button, textarea");
+  return target instanceof HTMLElement && Boolean(target.closest("input, select, button, textarea, [contenteditable=true]"));
 }
+
+function inControlArea(target: EventTarget | null) {
+  return target instanceof HTMLElement && Boolean(target.closest("#main-div, .sensor-preview-card"));
+}
+
+mainDiv.tabIndex = 0;
+mainDiv.addEventListener("pointerdown", () => mainDiv.focus());
 
 window.addEventListener("keydown", (event) => {
   if (controlSource !== "keyboard" || editableTarget(event.target)) return;
-  const reserved = keyboardMotionKeys.has(event.code) || event.code === "KeyK" || event.code === "KeyL";
+  if (event.code === "Tab" && !inControlArea(event.target)) return;
+  const reserved = keyboardMotionKeys.has(event.code) || event.code === "KeyK" || event.code === "KeyL" || (dualArm && event.code === "Tab");
   if (!reserved) return;
   // Capture before the NVIDIA WebRTC video parent forwards the same key to Kit.
   event.preventDefault();
   event.stopPropagation();
-  if (keyboardMotionKeys.has(event.code)) {
+  if (event.code === "Tab" && !event.repeat) {
+    armGrippers[activeArm] = keyboardGripperClosed;
+    activeArm = activeArm === "left" ? "right" : "left";
+    keyboardGripperClosed = armGrippers[activeArm];
+    pressedKeyboardKeys.clear();
+  } else if (keyboardMotionKeys.has(event.code)) {
     if (!event.repeat) pressedKeyboardKeys.add(event.code);
   } else if (event.code === "KeyK" && !event.repeat) {
     keyboardGripperClosed = !keyboardGripperClosed;
@@ -307,23 +337,27 @@ window.addEventListener("keydown", (event) => {
   } else {
     return;
   }
-  keyboardStatusElement.textContent = `Keys: ${[...pressedKeyboardKeys].join(" + ") || "idle"} | gripper: ${keyboardGripperClosed ? "closed" : "open"}`;
+  keyboardStatusElement.textContent = `${dualArm ? `Active: ${activeArm.toUpperCase()} | ` : ""}Keys: ${[...pressedKeyboardKeys].join(" + ") || "idle"} | gripper: ${keyboardGripperClosed ? "closed" : "open"}`;
   keyboardStatusElement.className = "status-text ok";
   sendKeyboardState();
 }, { capture: true });
 
 window.addEventListener("keyup", (event) => {
   if (controlSource !== "keyboard" || editableTarget(event.target)) return;
-  const reserved = keyboardMotionKeys.has(event.code) || event.code === "KeyK" || event.code === "KeyL";
+  if (event.code === "Tab" && !inControlArea(event.target)) return;
+  const reserved = keyboardMotionKeys.has(event.code) || event.code === "KeyK" || event.code === "KeyL" || (dualArm && event.code === "Tab");
   if (!reserved) return;
   event.preventDefault();
   event.stopPropagation();
   if (!pressedKeyboardKeys.delete(event.code)) return;
-  keyboardStatusElement.textContent = `Keys: ${[...pressedKeyboardKeys].join(" + ") || "idle"} | gripper: ${keyboardGripperClosed ? "closed" : "open"}`;
+  keyboardStatusElement.textContent = `${dualArm ? `Active: ${activeArm.toUpperCase()} | ` : ""}Keys: ${[...pressedKeyboardKeys].join(" + ") || "idle"} | gripper: ${keyboardGripperClosed ? "closed" : "open"}`;
   sendKeyboardState();
 }, { capture: true });
 
 window.addEventListener("blur", () => clearKeyboardMotion("Window lost focus; motion cleared."));
+document.addEventListener("focusin", (event) => {
+  if (editableTarget(event.target)) clearKeyboardMotion("Form focused; motion cleared.");
+});
 
 function updateButtons() {
   const hasSample = rawSample !== null;
@@ -425,6 +459,18 @@ enableControl.onchange = () => {
 function updateTelemetry(message: any) {
   const control = message.control ?? message.gello;
   const previews = message.previews ?? {};
+  if (control?.dual_arm && control.active_arm &&
+      (!keyboardSynchronized || (!pressedKeyboardKeys.size && control.sequence === keyboardSequence - 1))) {
+    dualArm = true;
+    activeArm = control.active_arm;
+    if (control.grippers) {
+      armGrippers.left = control.grippers.left;
+      armGrippers.right = control.grippers.right;
+      keyboardGripperClosed = armGrippers[activeArm];
+    }
+    keyboardSynchronized = true;
+  }
+  if (dualArm) byId("active-arm").textContent = activeArm.toUpperCase();
   if (!taskInput.dataset.sceneInitialized && message.scene_task) {
     taskInput.value = message.scene_task;
     taskInput.dataset.sceneInitialized = "true";
@@ -471,13 +517,23 @@ function sendViewCommand(view: StreamView) {
   socket.send(JSON.stringify({ type: "view", view }));
 }
 
-startRecordingButton.onclick = () => sendRecordingCommand("start");
+startRecordingButton.onclick = () => {
+  if (dualArm) {
+    activeArm = "left";
+    keyboardGripperClosed = false;
+    armGrippers.left = armGrippers.right = false;
+    pressedKeyboardKeys.clear();
+  }
+  sendRecordingCommand("start");
+};
 saveSuccessButton.onclick = () => sendRecordingCommand("success");
 saveFailureButton.onclick = () => sendRecordingCommand("failure");
 discardRecordingButton.onclick = () => sendRecordingCommand("discard");
 resetEnvironmentButton.onclick = () => {
   if (controlSource === "keyboard") {
     keyboardGripperClosed = false;
+    activeArm = "left";
+    armGrippers.left = armGrippers.right = false;
     clearKeyboardMotion("Environment reset requested; keyboard command cleared.");
   }
   sendRecordingCommand("reset");
@@ -514,6 +570,7 @@ function connectControlSocket() {
   socket = new WebSocket(`${scheme}://${window.location.host}/control`);
   socket.binaryType = "arraybuffer";
   socket.onopen = () => {
+    keyboardSynchronized = false;
     simStatusElement.textContent = "Simulator WebSocket connected.";
     simStatusElement.className = "status-text ok";
     sendKeyboardState();

@@ -1,4 +1,4 @@
-"""Direct seven-joint GELLO teleoperation for one simulated Isaac Lab Franka."""
+"""Isaac Lab Franka collection with single-arm and dual-arm keyboard scenes."""
 
 from __future__ import annotations
 
@@ -34,6 +34,7 @@ from robot_data_contracts import (
 from .backends import FRANKA_GRIPPER_CLOSED_M, IsaacLabFrankaBackend
 from .control import FRANKA_HOME, GelloCommandController, GelloSessionGate
 from .protocol import GelloCommand
+from .isaac_bimanual_control import BimanualKeyboardState, keyboard_ik_targets
 
 
 WEB_ROOT = Path(__file__).with_name("web")
@@ -48,6 +49,7 @@ ISAAC_SCENE_IDS = (
     "rigid_pick_place",
     "rigid_cube_lift",
     "l_table_basket",
+    "bimanual_tabletop_v17",
 )
 PHYSICS_BACKENDS = ("physx", "newton")
 # "mjwarp" is rigid-only and runs any scene. "coupled-vbd" adds the deformable
@@ -1963,6 +1965,7 @@ class GelloWebServer:
                         "fps": self._stream_fps,
                         "control_source": self._control_source,
                         "control_hz": self._control_hz,
+                        "dual_arm": isinstance(self._keyboard, BimanualKeyboardState),
                     }
                 ),
             )
@@ -2269,6 +2272,13 @@ def _parse_args() -> tuple[argparse.Namespace, object]:
         args.visual_demo_output = args.visual_demo_output.expanduser().resolve()
         if args.visual_demo_output.exists() and any(args.visual_demo_output.iterdir()):
             parser.error("visual demo output directory must be absent or empty")
+    elif args.scene == "bimanual_tabletop_v17":
+        if args.control_source != "keyboard" or args.physics_backend != "physx":
+            parser.error("bimanual_tabletop_v17 requires keyboard control and PhysX")
+        if args.visual_style != "dual_franka_tabletop":
+            parser.error("bimanual_tabletop_v17 requires the dual_franka_tabletop visual style")
+        if not args.enable_cameras:
+            parser.error("bimanual_tabletop_v17 requires --enable_cameras")
     elif args.visual_style != "baseline":
         parser.error("--visual-style requires --visual-demo-output")
     args.visual_asset = None
@@ -2324,6 +2334,8 @@ def _parse_args() -> tuple[argparse.Namespace, object]:
             )
     elif any(path is not None for path in workstation_paths):
         parser.error("workstation asset options require a USD workstation visual style")
+    if args.scene == "bimanual_tabletop_v17" and args.visual_asset["manifest_id"] != "bimanual_tabletop_v17":
+        parser.error("live bimanual scene requires the v17 manifest")
     if min(
         args.inference_steps,
         args.replan_steps,
@@ -2391,6 +2403,16 @@ def _parse_args() -> tuple[argparse.Namespace, object]:
             "--rendering_mode does not match renderer profile: "
             f"{args.rendering_mode!r} != {args.renderer_profile['rendering_mode']!r}"
         )
+    if args.scene == "bimanual_tabletop_v17":
+        # Retain the preview's fixed photographic exposure with the selected live renderer.
+        imaging = args.camera_profile["engine_overrides"]["isaac_sim"]["imaging"]
+        live_overrides = {
+            "/rtx/post/tonemap/filmIso": imaging["film_iso"],
+            "/rtx/post/tonemap/cameraShutter": imaging["camera_shutter_reciprocal_s"],
+            "/rtx/post/tonemap/fNumber": imaging["f_number"],
+        }
+        args.renderer_profile["kit_settings"].update(live_overrides)
+        args.renderer_profile["scene_overrides"] = live_overrides
     profile_kit_args = _renderer_profile_kit_args(args.renderer_profile)
     args.kit_args = " ".join(
         [part for part in (getattr(args, "kit_args", "").strip(), *profile_kit_args) if part]
@@ -2518,10 +2540,12 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
         args.visual_demo_output is not None
         and args.visual_style == "usd_workstation"
     )
+    live_bimanual = args.scene == "bimanual_tabletop_v17"
     dual_franka_tabletop = (
-        args.visual_demo_output is not None
+        (args.visual_demo_output is not None or live_bimanual)
         and args.visual_style == "dual_franka_tabletop"
     )
+    static_bimanual = dual_franka_tabletop and not live_bimanual
     usd_visual = usd_workstation or dual_franka_tabletop
     photoreal_visual = pbr_studio or usd_visual
     args.visual_camera_names = (
@@ -2538,7 +2562,7 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
         _load_static_link_pose(
             Path(args.visual_asset["recorded_visual_pose_file"])
         )
-        if dual_franka_tabletop
+        if static_bimanual
         and args.visual_asset.get("recorded_visual_pose_file") is not None
         else None
     )
@@ -2575,7 +2599,7 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
             device=args.device,
             # Offline path-traced inspection needs USD transforms to reflect the
             # recorded static joint pose. Fabric remains enabled everywhere else.
-            use_fabric=not dual_franka_tabletop,
+            use_fabric=not static_bimanual,
             **physics_kwargs,
         )
     )
@@ -2656,6 +2680,13 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
             float(args.visual_asset["composition"]["table_top_z_m"]),
             args.visual_asset["composition"],
         )
+        if live_bimanual:
+            scene_geometry.update(
+                task_instruction="Use Tab to switch arms and grasp the center cube",
+                bimanual_visual_only=False,
+                collision_policy="dynamic_robots_cube_and_hidden_table_proxy",
+                evaluator={"id": "operator_marked_outcome"},
+            )
     elif usd_workstation:
         scene_geometry = _workstation_cube_lift_geometry(
             float(args.visual_asset["composition"]["table_top_z_m"])
@@ -2756,7 +2787,7 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
             size=scene_geometry["work_surface_size_m"],
             collision_props=(
                 None
-                if dual_franka_tabletop
+                if static_bimanual
                 else sim_utils.CollisionPropertiesCfg()
             ),
             visual_material=sim_utils.PreviewSurfaceCfg(
@@ -2800,13 +2831,13 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
             spawn=sim_utils.CuboidCfg(
                 size=(scene_geometry["object_size_m"],) * 3,
                 rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                    kinematic_enabled=dual_franka_tabletop,
-                    disable_gravity=dual_franka_tabletop,
+                    kinematic_enabled=static_bimanual,
+                    disable_gravity=static_bimanual,
                 ),
                 mass_props=sim_utils.MassPropertiesCfg(mass=0.035),
                 collision_props=(
                     None
-                    if dual_franka_tabletop
+                    if static_bimanual
                     else sim_utils.CollisionPropertiesCfg()
                 ),
                 visual_material=sim_utils.PreviewSurfaceCfg(
@@ -2843,9 +2874,9 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
             cfg.init_state.pos = tuple(layout["base_position_world_m"])
             cfg.init_state.rot = _layout_orientation_xyzw(layout)
             cfg.spawn.collision_props = sim_utils.CollisionPropertiesCfg(
-                collision_enabled=False
+                collision_enabled=live_bimanual
             )
-            cfg.spawn.articulation_props.enabled_self_collisions = False
+            cfg.spawn.articulation_props.enabled_self_collisions = live_bimanual
         if init_pos is not None:
             cfg.init_state.pos = tuple(init_pos)
         if args.physics_backend == "newton":
@@ -2946,7 +2977,14 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                 scene_geometry["stream_camera_eye_m"]
             )
         camera_sensor_fps = max(args.dataset_fps, args.preview_fps)
-        if dual_franka_tabletop:
+        if live_bimanual:
+            isaac_overrides["side"] = dict(isaac_overrides["left"])
+            isaac_overrides["wrist"] = dict(isaac_overrides["right"])
+            camera_specs = tuple(
+                (name, "agentview", f"/World/RecordCamera_{name}", None)
+                for name in CAMERA_NAMES
+            )
+        elif dual_franka_tabletop:
             camera_specs = (
                 ("base", "agentview", "/World/RecordCamera", None),
                 ("top", "agentview", "/World/RecordCameraTop", None),
@@ -3212,7 +3250,7 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
             ]
     if record_cameras:
         posed_names = (
-            BIMANUAL_VISUAL_CAMERA_NAMES[:]
+            CAMERA_NAMES if live_bimanual else BIMANUAL_VISUAL_CAMERA_NAMES[:]
             if dual_franka_tabletop
             else ("base", "top", "side")
         )
@@ -3251,6 +3289,9 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
         for camera in record_cameras.values():
             camera.update(dt=sim_dt)
 
+    if live_bimanual:
+        stream_camera_eye = tuple(isaac_overrides["base"]["eye_world_m"])
+        stream_camera_target = tuple(isaac_overrides["base"]["target_world_m"])
     scene_status: dict[str, object] = {}
     if args.smoke_steps == 0:
         scene_status = _configure_stream_view(
@@ -3276,7 +3317,17 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
         max_joint_speed=args.max_joint_speed,
         watchdog_timeout=args.gello_timeout,
     )
-    keyboard = BrowserSe3KeyboardState(
+    backend_right = IsaacLabFrankaBackend(robot_right, device=sim.device) if live_bimanual else None
+    initial_right_positions = backend_right.current_joint_positions() if backend_right else None
+    controller_right = GelloCommandController(
+        initial_right_positions, backend_right.joint_position_limits(),
+        control_hz=args.control_hz, max_joint_speed=args.max_joint_speed,
+        watchdog_timeout=args.gello_timeout,
+    ) if backend_right else None
+    keyboard_factory = (
+        lambda **kwargs: BimanualKeyboardState(BrowserSe3KeyboardState, **kwargs)
+    ) if live_bimanual else BrowserSe3KeyboardState
+    keyboard = keyboard_factory(
         position_step_m=args.keyboard_position_step_m,
         rotation_step_rad=args.keyboard_rotation_step_rad,
         watchdog_timeout=args.gello_timeout,
@@ -3295,10 +3346,18 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
     hand_jacobian_index = hand_body_index - 1 if robot.is_fixed_base else hand_body_index
     jacobian_joint_ids = [index + robot.num_base_dofs for index in arm_joint_ids]
 
-    def keyboard_joint_targets(
-        sample: BrowserKeyboardSample, hold_targets: tuple[float, ...]
-    ) -> tuple[float, ...]:
-        """Map an official-style relative SE(3) command through Isaac Lab DLS IK."""
+    diff_ik_right = DifferentialIKController(
+        DifferentialIKControllerCfg(command_type="pose", use_relative_mode=True, ik_method="dls"),
+        num_envs=1, device=sim.device,
+    ) if live_bimanual else None
+
+    def keyboard_joint_targets(sample, hold_targets, *, arm="left"):
+        if live_bimanual:
+            return keyboard_ik_targets(
+                robot_right if arm == "right" else robot,
+                diff_ik_right if arm == "right" else diff_ik_controller,
+                sample, hold_targets, device=sim.device, world_axes=True,
+            )
         if not any(sample.delta_pose):
             return hold_targets
         ee_pose_w = robot.data.body_pose_w.torch[:, hand_body_index]
@@ -3320,6 +3379,14 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
         if not bool(torch.isfinite(desired).all().item()):
             raise RuntimeError("Differential IK produced a non-finite Franka target")
         return tuple(float(value) for value in desired[0].detach().cpu().tolist())
+
+    def reset_control_targets():
+        controller.reset_targets(initial_joint_positions)
+        keyboard.reset()
+        diff_ik_controller.reset()
+        if controller_right is not None:
+            controller_right.reset_targets(initial_right_positions)
+            diff_ik_right.reset()
 
     trajectory_ik_controller = DifferentialIKController(
         DifferentialIKControllerCfg(
@@ -3425,7 +3492,7 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
     )
     make_episode_writer = None
     if args.smoke_steps == 0:
-        from robot_data_contracts import AugmentationLineageV1, FrankaEpisodeWriter
+        from robot_data_contracts import AugmentationLineageV1, DualFrankaEpisodeWriter, FrankaEpisodeWriter
 
         try:
             engine_version = importlib.metadata.version("isaacsim")
@@ -3441,6 +3508,9 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
             "target_joint_position/panda_finger_joint1_m",
             "target_joint_position/panda_finger_joint2_m",
         ]
+        if live_bimanual:
+            state_names = [f"{arm}/{name}" for arm in ("left", "right") for name in state_names]
+            action_names = [f"{arm}/{name}" for arm in ("left", "right") for name in action_names]
         base_run_metadata = {
             "isaaclab_device": args.device,
             "gpu_id": args.gpu_id,
@@ -3497,6 +3567,20 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
             "dependency_packages": ["isaacsim", "numpy"],
         }
 
+        if live_bimanual:
+            base_run_metadata.update(
+                arm_ids=["left", "right"],
+                live_bimanual=True,
+                keyboard_coordinate_frame="world",
+                camera_roles={"base": "front workstation overview", "top": "top-down overview",
+                              "side": "left-front external view", "wrist": "right-front external view"},
+                camera_resolution=[args.width, args.height],
+                operator_command_layouts={"browser_se3_keyboard": [
+                    f"{arm}/{name}" for arm in ("left", "right")
+                    for name in ("dx_m", "dy_m", "dz_m", "droll_rad", "dpitch_rad", "dyaw_rad", "gripper_closed")
+                ]},
+            )
+
         def make_episode_writer(
             *,
             control_source: str,
@@ -3510,7 +3594,8 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
             run_metadata["control_source"] = control_source
             if metadata:
                 run_metadata.update(metadata)
-            return FrankaEpisodeWriter(
+            writer_class = DualFrankaEpisodeWriter if live_bimanual else FrankaEpisodeWriter
+            return writer_class(
                 args.data_dir,
                 fps=int(round(args.dataset_fps)),
                 engine_id="isaac_sim",
@@ -3547,6 +3632,8 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                     + ["requested_gripper_closed"]
                 )
             )
+            if live_bimanual:
+                operator_command_names = [f"{arm}/{name}" for arm in ("left", "right") for name in operator_command_names]
             policy_metadata = (
                 {
                     "policy": {
@@ -4443,8 +4530,10 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
     control_tick_ms: deque[float] = deque(maxlen=max(20, int(round(args.control_hz * 5))))
     control_tick_times: deque[float] = deque(maxlen=max(20, int(round(args.control_hz * 5))))
     safe_command = controller.tick(now=0.0) if args.smoke_steps else controller.tick()
+    active_arm = "left"
+    safe_right = controller_right.tick(now=0.0) if args.smoke_steps and controller_right else (controller_right.tick() if controller_right else None)
     keyboard_sample = keyboard.advance()
-    last_keyboard_command: tuple[str, int] | None = None
+    last_keyboard_command: tuple[str, int, str] | None = None
     target_at_watchdog: tuple[float, ...] | None = None
     initial_tcp_position = tuple(
         float(value)
@@ -4484,9 +4573,7 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                                 if writer.is_recording:
                                     raise RuntimeError("an episode is already recording")
                                 reset_task_assets()
-                                controller.reset_targets(initial_joint_positions)
-                                keyboard.reset()
-                                diff_ik_controller.reset()
+                                reset_control_targets()
                                 if cube_lift_evaluator is not None:
                                     cube_lift_evaluator.reset()
                                 episode_index = writer.start(task)
@@ -4545,9 +4632,7 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                                 if writer.is_recording:
                                     raise RuntimeError("finish or discard the active episode before reset")
                                 reset_task_assets()
-                                controller.reset_targets(initial_joint_positions)
-                                keyboard.reset()
-                                diff_ik_controller.reset()
+                                reset_control_targets()
                                 recording.update(error=None, last_event="Environment reset")
                         except (OSError, RuntimeError, ValueError) as exc:
                             recording.update(error=str(exc), last_event=f"ERROR: {exc}")
@@ -4618,11 +4703,14 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                             received_at=simulated_time,
                         )
                 if args.control_source == "keyboard":
-                    keyboard_sample = keyboard.advance(
-                        now=simulated_time if args.smoke_steps else None
-                    )
+                    if live_bimanual:
+                        active_arm, keyboard_sample = keyboard.advance_with_arm(
+                            now=simulated_time if args.smoke_steps else None
+                        )
+                    else:
+                        keyboard_sample = keyboard.advance(now=simulated_time if args.smoke_steps else None)
                     keyboard_command = (
-                        (keyboard_sample.session_id, keyboard_sample.sequence)
+                        (keyboard_sample.session_id, keyboard_sample.sequence, active_arm)
                         if keyboard_sample.session_id is not None
                         and keyboard_sample.sequence is not None
                         else None
@@ -4632,10 +4720,12 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                         and keyboard_command is not None
                         and keyboard_command != last_keyboard_command
                     ):
+                        selected_controller = controller_right if active_arm == "right" else controller
+                        selected_safe = safe_right if active_arm == "right" else safe_command
                         requested_joint_targets = keyboard_joint_targets(
-                            keyboard_sample, safe_command.joint_targets
+                            keyboard_sample, selected_safe.joint_targets, arm=active_arm
                         )
-                        controller.submit(
+                        selected_controller.submit(
                             GelloCommand(
                                 session_id="browser-keyboard-ik",
                                 # The browser sequence restarts after a reload. Use the
@@ -4648,7 +4738,16 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                             received_at=simulated_time if args.smoke_steps else None,
                         )
                         last_keyboard_command = keyboard_command
-                safe_command = controller.tick(now=simulated_time) if args.smoke_steps else controller.tick()
+                        telemetry.update(keyboard_applied_sequence=keyboard_sample.sequence)
+                safe_command = controller.tick(
+                    now=simulated_time if args.smoke_steps else None,
+                    force_hold=live_bimanual and (active_arm != "left" or keyboard_sample.watchdog_holding),
+                )
+                if controller_right is not None:
+                    safe_right = controller_right.tick(
+                        now=simulated_time if args.smoke_steps else None,
+                        force_hold=active_arm != "right" or keyboard_sample.watchdog_holding,
+                    )
                 recording_active = writer is not None and writer.is_recording
                 dataset_due = (
                     recording_active
@@ -4716,25 +4815,45 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                         ),
                         dtype=np.float32,
                     )
+                    extra_arrays = None
+                    if live_bimanual:
+                        right_finger_target = FRANKA_GRIPPER_CLOSED_M if safe_right.gripper_closed else 0.04
+                        right_state = (*backend_right.current_joint_positions(), *backend_right.current_gripper_positions(),
+                                       *backend_right.current_joint_velocities(), *backend_right.current_gripper_velocities())
+                        state = np.concatenate([state, np.asarray(right_state, np.float32)])
+                        action = np.concatenate([action, np.asarray((*safe_right.joint_targets, right_finger_target, right_finger_target), np.float32)])
+                        requested_action = np.concatenate([requested_action, np.asarray((*safe_right.requested_joint_targets, right_finger_target, right_finger_target), np.float32)])
+                        inactive_operator = np.asarray((*([0.0] * 6), float(safe_right.gripper_closed if active_arm == "left" else safe_command.gripper_closed)), np.float32)
+                        operator_command = np.concatenate([operator_command, inactive_operator] if active_arm == "left" else [inactive_operator, operator_command])
+                        extra_arrays = {
+                            "dual_active_arm": np.asarray([0 if active_arm == "left" else 1], np.int8),
+                            "left_ee_pose": robot.data.body_pose_w.torch[0, hand_body_index].detach().cpu().numpy(),
+                            "right_ee_pose": robot_right.data.body_pose_w.torch[0, robot_right.find_bodies("panda_hand")[0][0]].detach().cpu().numpy(),
+                        }
                     ee_pose = None
                     object_pose = None
                     object_velocity = None
-                    if cube_lift_evaluator is not None and task_object is not None:
+                    if (cube_lift_evaluator is not None or live_bimanual) and task_object is not None:
                         ee_pose = (
                             robot.data.body_pose_w.torch[0, hand_body_index]
                             .detach().cpu().numpy()
                         )
                         object_pose = task_object.data.root_pose_w.torch[0].detach().cpu().numpy()
                         object_velocity = task_object.data.root_vel_w.torch[0].detach().cpu().numpy()
-                        cube_lift_evaluator.update(
-                            object_z_m=float(object_pose[2]),
-                            gripper_closed=safe_command.gripper_closed,
-                        )
-                        telemetry.update(task_evaluator=cube_lift_evaluator.result())
+                        if cube_lift_evaluator is not None:
+                            cube_lift_evaluator.update(
+                                object_z_m=float(object_pose[2]),
+                                gripper_closed=safe_command.gripper_closed,
+                            )
+                            telemetry.update(task_evaluator=cube_lift_evaluator.result())
                     backend.set_command(
                         safe_command.joint_targets,
                         gripper_closed=safe_command.gripper_closed,
                     )
+                    if backend_right is not None:
+                        backend_right.set_command(
+                            safe_right.joint_targets, gripper_closed=safe_right.gripper_closed,
+                        )
                     writer.add_frame(
                         images=images,
                         state=state,
@@ -4756,6 +4875,7 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                             else -1
                         ),
                         capture_timestamp_ns=capture_timestamp_ns,
+                        extra_arrays=extra_arrays,
                         ee_pose=ee_pose,
                         object_pose=object_pose,
                         object_velocity=object_velocity,
@@ -4766,6 +4886,8 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                         safe_command.joint_targets,
                         gripper_closed=safe_command.gripper_closed,
                     )
+                if backend_right is not None and not dataset_due:
+                    backend_right.set_command(safe_right.joint_targets, gripper_closed=safe_right.gripper_closed)
                 if safe_command.watchdog_holding and target_at_watchdog is None:
                     target_at_watchdog = safe_command.joint_targets
                 control_finished = time.perf_counter()
@@ -4830,6 +4952,13 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                 object_position_m=object_position_m,
                 physics_step=physics_step,
             )
+            if backend_right is not None:
+                telemetry.update(dual_arm=True, active_arm=active_arm,
+                    right_actual_joint_positions=list(backend_right.current_joint_positions()),
+                    right_finger_positions=list(backend_right.current_gripper_positions()),
+                    left_ee_pose=robot.data.body_pose_w.torch[0, hand_body_index].detach().cpu().tolist(),
+                    right_ee_pose=robot_right.data.body_pose_w.torch[0, robot_right.find_bodies("panda_hand")[0][0]].detach().cpu().tolist(),
+                    right_control=controller_right.status())
             physics_step += 1
             if args.smoke_steps and physics_step >= args.smoke_steps:
                 break
