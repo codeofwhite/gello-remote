@@ -50,6 +50,8 @@ ISAAC_SCENE_IDS = (
     "rigid_cube_lift",
     "l_table_basket",
     "bimanual_tabletop_v17",
+    "bimanual_tabletop_v17_cloth",
+    "bimanual_tabletop_v17_clothforge",
 )
 PHYSICS_BACKENDS = ("physx", "newton")
 # "mjwarp" is rigid-only and runs any scene. "coupled-vbd" adds the deformable
@@ -914,7 +916,7 @@ def _l_table_basket_geometry(scene_usd: Path) -> dict[str, object]:
 
 
 def _spawn_l_table_cloth(
-    scene_geometry: dict[str, object], backend: str = "physx"
+    scene_geometry: dict[str, object], backend: str = "physx", cloth_usd: Path | None = None
 ) -> object:
     """Spawn the worktop cloth as a surface deformable on the given physics backend.
 
@@ -960,21 +962,39 @@ def _spawn_l_table_cloth(
             edge_kd=NEWTON_CLOTH_EDGE_KD,
         )
 
+    position = tuple(scene_geometry["cloth_start_m"])
+    visual_material = sim_utils.PreviewSurfaceCfg(
+        diffuse_color=(0.88, 0.82, 0.68) if cloth_usd is not None else CLOTH_COLOR_RGB,
+        roughness=0.9 if cloth_usd is not None else 0.5,
+    )
+    if cloth_usd is not None:
+        import numpy as np
+        from pxr import Usd, UsdGeom
+
+        source = Usd.Stage.Open(str(cloth_usd))
+        mesh = next(UsdGeom.Mesh(prim) for prim in source.Traverse() if prim.IsA(UsdGeom.Mesh))
+        points = np.asarray(mesh.GetPointsAttr().Get(), dtype=np.float64)
+        center = (points.min(axis=0) + points.max(axis=0)) * 0.5
+        position = tuple(float(target - offset) for target, offset in zip(position, center))
+        spawn = sim_utils.UsdFileCfg(
+            usd_path=str(cloth_usd),
+            deformable_props=deformable_props,
+            physics_material=physics_material,
+            visual_material=visual_material,
+        )
+    else:
+        spawn = sim_utils.MeshRectangleCfg(
+            size=(CLOTH_SIZE_M, CLOTH_SIZE_M),
+            resolution=(CLOTH_RESOLUTION, CLOTH_RESOLUTION),
+            deformable_props=deformable_props,
+            physics_material=physics_material,
+            visual_material=visual_material,
+        )
     return DeformableObject(
         cfg=DeformableObjectCfg(
             prim_path=CLOTH_PRIM_PATH,
-            spawn=sim_utils.MeshRectangleCfg(
-                size=(CLOTH_SIZE_M, CLOTH_SIZE_M),
-                resolution=(CLOTH_RESOLUTION, CLOTH_RESOLUTION),
-                deformable_props=deformable_props,
-                physics_material=physics_material,
-                visual_material=sim_utils.PreviewSurfaceCfg(
-                    diffuse_color=CLOTH_COLOR_RGB
-                ),
-            ),
-            init_state=DeformableObjectCfg.InitialStateCfg(
-                pos=tuple(scene_geometry["cloth_start_m"])
-            ),
+            spawn=spawn,
+            init_state=DeformableObjectCfg.InitialStateCfg(pos=position),
         )
     )
 
@@ -2124,6 +2144,8 @@ def _parse_args() -> tuple[argparse.Namespace, object]:
         default=None,
         help="fixture USD entrypoint for scenes whose geometry comes from an asset",
     )
+    parser.add_argument("--clothforge-dir", type=Path, help="selected ClothForge garment directory")
+    parser.add_argument("--clothforge-params", type=json.loads, default={}, help="resolved ClothForge selection and material/placement parameters as JSON")
     parser.add_argument(
         "--work-surface-height-m",
         type=float,
@@ -2272,9 +2294,11 @@ def _parse_args() -> tuple[argparse.Namespace, object]:
         args.visual_demo_output = args.visual_demo_output.expanduser().resolve()
         if args.visual_demo_output.exists() and any(args.visual_demo_output.iterdir()):
             parser.error("visual demo output directory must be absent or empty")
-    elif args.scene == "bimanual_tabletop_v17":
-        if args.control_source != "keyboard" or args.physics_backend != "physx":
-            parser.error("bimanual_tabletop_v17 requires keyboard control and PhysX")
+    elif args.scene in {"bimanual_tabletop_v17", "bimanual_tabletop_v17_cloth", "bimanual_tabletop_v17_clothforge"}:
+        if args.control_source != "keyboard":
+            parser.error("bimanual_tabletop_v17 requires keyboard control")
+        if args.physics_backend != "physx" and args.scene != "bimanual_tabletop_v17_clothforge":
+            parser.error("this bimanual scene requires PhysX")
         if args.visual_style != "dual_franka_tabletop":
             parser.error("bimanual_tabletop_v17 requires the dual_franka_tabletop visual style")
         if not args.enable_cameras:
@@ -2334,7 +2358,7 @@ def _parse_args() -> tuple[argparse.Namespace, object]:
             )
     elif any(path is not None for path in workstation_paths):
         parser.error("workstation asset options require a USD workstation visual style")
-    if args.scene == "bimanual_tabletop_v17" and args.visual_asset["manifest_id"] != "bimanual_tabletop_v17":
+    if args.scene in {"bimanual_tabletop_v17", "bimanual_tabletop_v17_cloth", "bimanual_tabletop_v17_clothforge"} and args.visual_asset["manifest_id"] != "bimanual_tabletop_v17":
         parser.error("live bimanual scene requires the v17 manifest")
     if min(
         args.inference_steps,
@@ -2403,7 +2427,7 @@ def _parse_args() -> tuple[argparse.Namespace, object]:
             "--rendering_mode does not match renderer profile: "
             f"{args.rendering_mode!r} != {args.renderer_profile['rendering_mode']!r}"
         )
-    if args.scene == "bimanual_tabletop_v17":
+    if args.scene in {"bimanual_tabletop_v17", "bimanual_tabletop_v17_cloth", "bimanual_tabletop_v17_clothforge"}:
         # Retain the preview's fixed photographic exposure with the selected live renderer.
         imaging = args.camera_profile["engine_overrides"]["isaac_sim"]["imaging"]
         live_overrides = {
@@ -2459,7 +2483,7 @@ def _enable_newton_extensions() -> None:
         ) from exc
 
 
-def _newton_physics_cfg(solver: str, use_cuda_graph: bool) -> Any:
+def _newton_physics_cfg(solver: str, use_cuda_graph: bool, garment_config=None) -> Any:
     """Build the Newton solver config behind `--physics-backend newton`."""
     from isaaclab_newton.physics import MJWarpSolverCfg, NewtonCfg
 
@@ -2492,22 +2516,37 @@ def _newton_physics_cfg(solver: str, use_cuda_graph: bool) -> Any:
         # The base NewtonCfg carries no model_cfg field; the deformable solver reads it.
         model_cfg: NewtonModelCfg | None = None
 
+    settings = (garment_config or {}).get("simulation", {})
+    material = (garment_config or {}).get("material", {})
+    manager_override = {}
+    if garment_config:
+        from .isaac_clothforge import clothforge_newton_manager
+        manager_override["class_type"] = clothforge_newton_manager()
     return _NewtonPhysicsCfg(
         solver_cfg=CoupledMJWarpVBDSolverCfg(
+            **manager_override,
             rigid_solver_cfg=rigid_solver_cfg,
             soft_solver_cfg=VBDSolverCfg(
-                iterations=10,
+                iterations=settings.get("iterations", 10),
                 integrate_with_external_rigid_solver=True,
-                particle_enable_self_contact=False,
+                particle_enable_self_contact=bool(garment_config),
+                particle_self_contact_radius=settings.get("self_contact_radius_m", .005),
+                particle_self_contact_margin=settings.get("self_contact_margin_m", .005),
+                particle_collision_detection_interval=settings.get("collision_detection_interval", -1),
+                particle_topological_contact_filter_threshold=settings.get("topological_contact_filter_threshold", 2),
+                particle_vertex_contact_buffer_size=settings.get("vertex_contact_buffer_size", 32),
+                particle_edge_contact_buffer_size=settings.get("edge_contact_buffer_size", 64),
             ),
             coupling_mode="two_way",
         ),
         model_cfg=NewtonModelCfg(
-            soft_contact_ke=1e3,
-            soft_contact_kd=1e-5,
-            soft_contact_mu=0.5,
+            soft_contact_ke=settings.get("soft_contact_ke", 1e3),
+            soft_contact_kd=settings.get("soft_contact_kd", 1e-5),
+            soft_contact_mu=material.get("friction", .5),
         ),
-        num_substeps=10,
+        # ClothForge runs inside the worker's existing physics loop. Use one
+        # VBD step per tick instead of the rigid-only 10x subdivision.
+        num_substeps=1 if garment_config else 10,
         use_cuda_graph=use_cuda_graph,
     )
 
@@ -2540,7 +2579,9 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
         args.visual_demo_output is not None
         and args.visual_style == "usd_workstation"
     )
-    live_bimanual = args.scene == "bimanual_tabletop_v17"
+    clothforge_scene = args.scene == "bimanual_tabletop_v17_clothforge"
+    bimanual_cloth = args.scene in {"bimanual_tabletop_v17_cloth", "bimanual_tabletop_v17_clothforge"}
+    live_bimanual = args.scene in {"bimanual_tabletop_v17", "bimanual_tabletop_v17_cloth", "bimanual_tabletop_v17_clothforge"}
     dual_franka_tabletop = (
         (args.visual_demo_output is not None or live_bimanual)
         and args.visual_style == "dual_franka_tabletop"
@@ -2567,17 +2608,20 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
         else None
     )
     newton_physics = None
-    # The cloth only exists under the coupled solver: plain mjwarp is rigid-only. It
-    # cannot go the other way either -- the coupled solver needs particles to exist, so
-    # it must not be picked when no cloth will be spawned. `cloth_start_m` only ever
-    # comes from the L-table scene, so this is decidable before the scene geometry is
-    # resolved (that happens further down, after the sim is built).
+    # Cloth needs the coupled solver; plain MJWarp handles rigid bodies only.
     newton_solver = args.newton_solver
     if args.physics_backend == "newton":
-        if args.cloth and args.scene == "l_table_basket":
+        if (args.cloth and args.scene == "l_table_basket") or clothforge_scene:
             newton_solver = "coupled-vbd"
         _enable_newton_extensions()
-        newton_physics = _newton_physics_cfg(newton_solver, args.newton_cuda_graph)
+        garment_config = None
+        if clothforge_scene:
+            from .isaac_clothforge import newton_garment_config
+            preset = args.clothforge_params.get("material_preset", "medium")
+            garment_config = newton_garment_config(args.clothforge_dir, preset)
+            garment_config["simulation"]["iterations"] = int(args.clothforge_params.get("cloth_iterations", 30))
+            garment_config["material"]["friction"] = args.clothforge_params.get("friction", garment_config["material"]["friction"])
+        newton_physics = _newton_physics_cfg(newton_solver, args.newton_cuda_graph, garment_config)
         print(
             "ISAAC_PHYSICS_BACKEND "
             + json.dumps(
@@ -2687,6 +2731,18 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                 collision_policy="dynamic_robots_cube_and_hidden_table_proxy",
                 evaluator={"id": "operator_marked_outcome"},
             )
+        if bimanual_cloth:
+            if not clothforge_scene and args.scene_usd is None:
+                raise ValueError("bimanual_tabletop_v17_cloth requires --scene-usd")
+            if clothforge_scene and args.clothforge_dir is None:
+                raise ValueError("ClothForge scene requires --clothforge-dir")
+            scene_geometry.update(
+                cloth_start_m=(*scene_geometry["object_start_m"][:2],
+                               scene_geometry["work_surface_top_m"] + 0.025),
+                task_instruction="Use Tab to switch arms and manipulate the cloth",
+                collision_policy="dynamic_robots_cloth_and_hidden_table_proxy",
+                required_prims=("/World/WorkSurface", "/World/FrankaRight"),
+            )
     elif usd_workstation:
         scene_geometry = _workstation_cube_lift_geometry(
             float(args.visual_asset["composition"]["table_top_z_m"])
@@ -2706,7 +2762,7 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
     # deactivation cannot drift apart.
     cloth_supported = args.physics_backend != "newton" or newton_solver == "coupled-vbd"
     cloth_requested = bool(
-        args.cloth and scene_geometry is not None and "cloth_start_m" in scene_geometry
+        (args.cloth or bimanual_cloth) and scene_geometry is not None and "cloth_start_m" in scene_geometry
     )
     if (
         cloth_requested
@@ -2826,31 +2882,32 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                 target_cfg,
                 translation=scene_geometry["target_center_m"],
             )
-        object_cfg = RigidObjectCfg(
-            prim_path="/World/TaskObject",
-            spawn=sim_utils.CuboidCfg(
-                size=(scene_geometry["object_size_m"],) * 3,
-                rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                    kinematic_enabled=static_bimanual,
-                    disable_gravity=static_bimanual,
+        if not bimanual_cloth:
+            object_cfg = RigidObjectCfg(
+                prim_path="/World/TaskObject",
+                spawn=sim_utils.CuboidCfg(
+                    size=(scene_geometry["object_size_m"],) * 3,
+                    rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                        kinematic_enabled=static_bimanual,
+                        disable_gravity=static_bimanual,
+                    ),
+                    mass_props=sim_utils.MassPropertiesCfg(mass=0.035),
+                    collision_props=(
+                        None
+                        if static_bimanual
+                        else sim_utils.CollisionPropertiesCfg()
+                    ),
+                    visual_material=sim_utils.PreviewSurfaceCfg(
+                        diffuse_color=(0.94, 0.24, 0.08) if photoreal_visual else (0.25, 0.86, 0.38),
+                        roughness=0.20 if photoreal_visual else 0.5,
+                        metallic=0.12 if photoreal_visual else 0.0,
+                    ),
                 ),
-                mass_props=sim_utils.MassPropertiesCfg(mass=0.035),
-                collision_props=(
-                    None
-                    if static_bimanual
-                    else sim_utils.CollisionPropertiesCfg()
+                init_state=RigidObjectCfg.InitialStateCfg(
+                    pos=scene_geometry["object_start_m"]
                 ),
-                visual_material=sim_utils.PreviewSurfaceCfg(
-                    diffuse_color=(0.94, 0.24, 0.08) if photoreal_visual else (0.25, 0.86, 0.38),
-                    roughness=0.20 if photoreal_visual else 0.5,
-                    metallic=0.12 if photoreal_visual else 0.0,
-                ),
-            ),
-            init_state=RigidObjectCfg.InitialStateCfg(
-                pos=scene_geometry["object_start_m"]
-            ),
-        )
-        task_object = RigidObject(cfg=object_cfg)
+            )
+            task_object = RigidObject(cfg=object_cfg)
 
     def franka_cfg(
         prim_path: str,
@@ -2928,15 +2985,26 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
             raise RuntimeError(
                 f"cloth requested but newton solver {newton_solver!r} has no soft bodies"
             )
-        cloth_object = _spawn_l_table_cloth(scene_geometry, args.physics_backend)
+        if clothforge_scene:
+            from .isaac_clothforge import load_garment, spawn_garment
+            garment = load_garment(args.clothforge_dir, args.clothforge_params, scene_geometry["cloth_start_m"], args.physics_backend)
+            scene_geometry["clothforge"] = garment["metadata"]
+            scene_geometry["task_instruction"] = "Use Tab to switch arms and manipulate the selected garment"
+            cloth_object = spawn_garment(CLOTH_PRIM_PATH, garment, args.physics_backend)
+        else:
+            cloth_object = _spawn_l_table_cloth(
+                scene_geometry, args.physics_backend, args.scene_usd if bimanual_cloth else None
+            )
     if cloth_object is not None:
         print(
             "ISAAC_CLOTH "
             + json.dumps(
                 {
                     "prim_path": CLOTH_PRIM_PATH,
-                    "size_m": CLOTH_SIZE_M,
-                    "resolution": CLOTH_RESOLUTION,
+                    "asset_usd": str(args.scene_usd) if args.scene_usd and bimanual_cloth else None,
+                    "clothforge": scene_geometry.get("clothforge"),
+                    "size_m": None if bimanual_cloth else CLOTH_SIZE_M,
+                    "resolution": None if bimanual_cloth else CLOTH_RESOLUTION,
                     "start_m": list(scene_geometry["cloth_start_m"]),
                 },
                 sort_keys=True,
@@ -3108,6 +3176,12 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
             task_object.write_root_velocity_to_sim_index(root_velocity=root_state[:, 7:])
             task_object.reset()
             task_object.update(sim_dt)
+        if bimanual_cloth and cloth_object is not None:
+            cloth_object.write_nodal_state_to_sim_index(
+                nodal_state=cloth_object.data.default_nodal_state_w.torch.clone()
+            )
+            cloth_object.reset()
+            cloth_object.update(sim_dt)
 
     visual_link_pose_ops: dict[tuple[str, str], object] = {}
 
@@ -3353,8 +3427,32 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
 
     def keyboard_joint_targets(sample, hold_targets, *, arm="left"):
         if live_bimanual:
+            selected_robot = robot_right if arm == "right" else robot
+            if args.physics_backend == "newton":
+                if not any(sample.delta_pose):
+                    return hold_targets
+                from .isaac_clothforge import newton_hand_jacobian
+                from isaaclab.utils.math import quat_apply_inverse
+                selected_ik = diff_ik_right if arm == "right" else diff_ik_controller
+                ids = selected_robot.find_joints([f"panda_joint{i}" for i in range(1, 8)], preserve_order=True)[0]
+                hand_id = selected_robot.find_bodies("panda_hand")[0][0]
+                root = selected_robot.data.root_pose_w.torch
+                hand = selected_robot.data.body_pose_w.torch[:, hand_id]
+                pos, quat = subtract_frame_transforms(root[:, :3], root[:, 3:7], hand[:, :3], hand[:, 3:7])
+                command = torch.tensor([sample.delta_pose], dtype=torch.float32, device=sim.device)
+                command = torch.cat([quat_apply_inverse(root[:, 3:7], command[:, :3]),
+                                     quat_apply_inverse(root[:, 3:7], command[:, 3:])], dim=-1)
+                jacobian = newton_hand_jacobian(selected_robot)
+                rotation = root[:, 3:7].unsqueeze(1).expand(-1, len(ids), -1)
+                for block in (slice(0, 3), slice(3, 6)):
+                    jacobian[:, block, :] = quat_apply_inverse(rotation, jacobian[:, block, :].transpose(1, 2)).transpose(1, 2)
+                selected_ik.set_command(command, pos, quat)
+                desired = selected_ik.compute(pos, quat, jacobian, selected_robot.data.joint_pos.torch[:, ids])
+                if not bool(torch.isfinite(desired).all().item()):
+                    raise RuntimeError("Newton keyboard IK produced a non-finite Franka target")
+                return tuple(float(value) for value in desired[0].detach().cpu().tolist())
             return keyboard_ik_targets(
-                robot_right if arm == "right" else robot,
+                selected_robot,
                 diff_ik_right if arm == "right" else diff_ik_controller,
                 sample, hold_targets, device=sim.device, world_axes=True,
             )
@@ -3515,6 +3613,9 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
             "isaaclab_device": args.device,
             "gpu_id": args.gpu_id,
             "physics_hz": args.physics_hz,
+            "physics_backend": args.physics_backend,
+            "physics_solver": newton_solver if args.physics_backend == "newton" else "physx",
+            "physics_substeps": newton_physics.num_substeps if newton_physics is not None else 1,
             "control_hz": args.control_hz,
             "control_source_options": [
                 "browser_se3_keyboard",
@@ -4952,6 +5053,14 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                 object_position_m=object_position_m,
                 physics_step=physics_step,
             )
+            if bimanual_cloth and physics_step % stream_decimation == 0:
+                cloth_positions = cloth_object.data.nodal_pos_w.torch[0]
+                telemetry.update(
+                    cloth_center_m=cloth_positions.mean(dim=0).detach().cpu().tolist(),
+                    cloth_z_range_m=[float(cloth_positions[:, 2].min().item()),
+                                     float(cloth_positions[:, 2].max().item())],
+                    cloth_node_count=int(cloth_positions.shape[0]),
+                )
             if backend_right is not None:
                 telemetry.update(dual_arm=True, active_arm=active_arm,
                     right_actual_joint_positions=list(backend_right.current_joint_positions()),
