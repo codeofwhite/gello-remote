@@ -3816,6 +3816,17 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
             report = new_batch_report(plan, args.generation_plan)
             write_json_atomic(report_path, report)
 
+        # Trajectory batches have no Collector socket; signal native readiness
+        # only after simulator initialization and plan/report validation.
+        ready_file = os.environ.get("ROBOT_DATA_STUDIO_READY_FILE")
+        if ready_file:
+            ready_path = Path(ready_file)
+            ready_path.parent.mkdir(parents=True, exist_ok=True)
+            ready_tmp = ready_path.with_suffix(".tmp")
+            ready_tmp.write_text(json.dumps({"run_id": os.environ.get("ROBOT_DATA_STUDIO_RUN_ID"),
+                "scene_id": args.scene, "plan": str(args.generation_plan)}))
+            ready_tmp.replace(ready_path)
+
         source_cache: dict[str, tuple[object, np.ndarray]] = {}
         trajectory_controller = GelloCommandController(
             initial_joint_positions,
