@@ -2146,6 +2146,7 @@ def _parse_args() -> tuple[argparse.Namespace, object]:
     )
     parser.add_argument("--clothforge-dir", type=Path, help="selected ClothForge garment directory")
     parser.add_argument("--clothforge-params", type=json.loads, default={}, help="resolved ClothForge selection and material/placement parameters as JSON")
+    parser.add_argument('--environment-appearance', type=json.loads, default={}, help='resolved tabletop/background visual materials')
     parser.add_argument(
         "--work-surface-height-m",
         type=float,
@@ -2261,6 +2262,13 @@ def _parse_args() -> tuple[argparse.Namespace, object]:
     )
     AppLauncher.add_app_launcher_args(parser)
     args = parser.parse_args()
+    from robot_data_contracts.usd_surface import validate_environment
+    try:
+        validate_environment(args.environment_appearance)
+        if any(args.environment_appearance.values()) and args.scene not in {'bimanual_tabletop_v17', 'bimanual_tabletop_v17_cloth', 'bimanual_tabletop_v17_clothforge'}:
+            raise ValueError('环境外观当前支持双臂实验台 v17')
+    except ValueError as exc:
+        parser.error(str(exc))
     try:
         _configure_gpu_selection(args, sys.argv[1:])
     except ValueError as exc:
@@ -2683,6 +2691,12 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
             "/World/Workstation",
             workstation_cfg,
         )
+        from robot_data_contracts.usd_surface import apply_environment, workstation_targets
+        import omni.usd
+        environment_surfaces = apply_environment(omni.usd.get_context().get_stage(), args.environment_appearance,
+                                                workstation_targets(args.visual_asset['composition']))
+        args.visual_asset = {**args.visual_asset, 'environment_appearance': args.environment_appearance,
+                             'environment_surfaces': environment_surfaces}
     if pbr_studio:
         key_light_cfg = sim_utils.SphereLightCfg(
             intensity=18000.0,

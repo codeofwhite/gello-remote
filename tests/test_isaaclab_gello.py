@@ -64,6 +64,12 @@ def test_trajectory_is_an_explicit_control_source() -> None:
     assert "trajectory" in CONTROL_SOURCES
 
 
+def test_environment_targets_follow_workstation_composition():
+    from robot_data_contracts.usd_surface import workstation_targets
+    targets = workstation_targets({'table_prim_path': '/World/Workstation/Bench/Tabletop'})
+    assert targets == {'tabletop': ['/World/Workstation/Bench/Tabletop'], 'background': ['/World/Workstation/Backdrop']}
+
+
 def test_evaluation_position_split_distinguishes_nominal_and_planned_runs() -> None:
     assert _evaluation_position_split(None) == "nominal"
     assert _evaluation_position_split(SimpleNamespace(position_split="m2_train")) == "m2_train"
