@@ -2146,6 +2146,7 @@ def _parse_args() -> tuple[argparse.Namespace, object]:
     )
     parser.add_argument("--clothforge-dir", type=Path, help="selected ClothForge garment directory")
     parser.add_argument("--clothforge-params", type=json.loads, default={}, help="resolved ClothForge selection and material/placement parameters as JSON")
+    parser.add_argument('--camera-lighting', type=json.loads, default=None, help='resolved camera and lighting snapshot')
     parser.add_argument('--environment-appearance', type=json.loads, default={}, help='resolved tabletop/background visual materials')
     parser.add_argument(
         "--work-surface-height-m",
@@ -2265,6 +2266,10 @@ def _parse_args() -> tuple[argparse.Namespace, object]:
     from robot_data_contracts.usd_surface import validate_environment
     try:
         validate_environment(args.environment_appearance)
+        from robot_data_contracts.camera_lighting import validate_resolved
+        validate_resolved(args.camera_lighting)
+        if args.camera_lighting is not None and args.scene not in {'bimanual_tabletop_v17', 'bimanual_tabletop_v17_cloth', 'bimanual_tabletop_v17_clothforge'}:
+            raise ValueError('相机光照控制当前支持双臂实验台 v17')
         if any(args.environment_appearance.values()) and args.scene not in {'bimanual_tabletop_v17', 'bimanual_tabletop_v17_cloth', 'bimanual_tabletop_v17_clothforge'}:
             raise ValueError('环境外观当前支持双臂实验台 v17')
     except ValueError as exc:
@@ -3089,7 +3094,12 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                     ),
                 ),
             )
+        visual_values = args.camera_lighting['values'] if args.camera_lighting else {}
         for camera_name, role_name, prim_path, offset in camera_specs:
+            if args.camera_lighting:
+                isaac_overrides[camera_name]['nominal_vertical_fov_deg'] += visual_values['fov_offset_deg']
+                if not 5 <= isaac_overrides[camera_name]['nominal_vertical_fov_deg'] <= 150:
+                    raise ValueError('相机 FOV 超出 5–150 度')
             matrix, intrinsic_source = _camera_intrinsic_matrix(
                 profile["roles"][role_name],
                 width=args.width,
@@ -3374,6 +3384,21 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                         device=sim.device,
                     ),
                 )
+        if args.camera_lighting is not None:
+            import omni.usd
+            from robot_data_contracts.usd_camera_lighting import apply_camera, apply_lighting, apply_imaging
+            camera_stage = omni.usd.get_context().get_stage()
+            # FOV already applied when building the sensor's intrinsic matrix.
+            pose_values = {**visual_values, 'fov_offset_deg': 0}
+            effective_cameras = {name: apply_camera(camera_stage, camera_prim_paths[name], pose_values, args.width, args.height) for name in posed_names}
+            for name, effective in effective_cameras.items():
+                camera_intrinsic_matrices[name] = [v for row in effective['intrinsics'] for v in row]
+            args.camera_lighting_applied = {'cameras': effective_cameras,
+                'lights': apply_lighting(camera_stage, visual_values),
+                'imaging': apply_imaging(carb.settings.get_settings(), visual_values)}
+            args.renderer_settings_readback.update({
+                '/rtx/post/tonemap/filmIso': args.camera_lighting_applied['imaging']['film_iso'],
+                '/rtx/post/tonemap/whitepoint': args.camera_lighting_applied['imaging']['white_point_rgb']})
         for camera in record_cameras.values():
             camera.update(dt=sim_dt)
 
@@ -3669,7 +3694,9 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
             "visual_asset": args.visual_asset,
             "camera_intrinsic_sources": camera_intrinsic_sources,
             "camera_intrinsic_matrices": camera_intrinsic_matrices,
-            "camera_extrinsics": isaac_overrides,
+            "camera_extrinsics": args.camera_lighting_applied["cameras"] if hasattr(args, "camera_lighting_applied") else isaac_overrides,
+            "camera_lighting": args.camera_lighting,
+            "camera_lighting_applied": getattr(args, "camera_lighting_applied", None),
             "camera_roles": {
                 "base": "third-person agentview",
                 "top": "virtual auxiliary top-down XY alignment",

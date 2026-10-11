@@ -1125,3 +1125,12 @@ def test_forward_bases_fit_rotated_mounts_with_rear_edge_clearance():
              "right": ([1.0054, .1484, .772], [1.1946, .3741, .912])}
     report = _validate_bimanual_mount_bounds(c, table, bases)
     assert all(v["minimum_table_edge_clearance_m"] > .075 for v in report.values())
+
+
+def test_v5_camera_profile_keeps_original_views_and_nominal_calibration():
+    root = Path('/data/zhanghejun/robot-data-studio/config/camera_profiles')
+    original = _load_camera_profile(root/'isaac_bimanual_tabletop_visual_v4.json', width=960, height=720)
+    extended = _load_camera_profile(root/'isaac_bimanual_tabletop_visual_v5.json', width=960, height=720)
+    assert extended['engine_overrides'] == original['engine_overrides']
+    assert extended['roles'] == original['roles']
+    assert extended['match_level'] == 'nominal_pending_intrinsics'
