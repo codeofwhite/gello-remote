@@ -77,8 +77,23 @@ def load_garment(directory: Path, parameters: dict, start_m: tuple, backend="phy
     with np.load(mesh_path, allow_pickle=False) as source:
         vertices = source["vertices"].copy()
         faces = source["faces"].astype(np.int32)
-        rest = source["rest_triangles"].copy() if backend == "newton" else None
+        pattern = source["rest_triangles"].copy()
+        rest = pattern if backend == "newton" else None
         seams = source["seam_edges"].copy() if backend == "newton" else None
+    # Per-corner coordinates retain UV discontinuities across welded seams.
+    uv = pattern[..., :2].copy()
+    low, high = uv.reshape(-1, 2).min(0), uv.reshape(-1, 2).max(0)
+    if np.any(high <= low):
+        raise ValueError("ClothForge pattern has no UV extent")
+    uv = ((uv - low) / (high - low)).astype(np.float32)
+    appearance = parameters.get("appearance", {"texture": "none", "color": "#386ba1", "roughness": .9,
+        "texture_path": None, "texture_sha256": None, "uv_mapping": "pattern_xy_face_varying"})
+    from robot_data_contracts.pbr_material import verify_maps
+    verify_maps(appearance)
+    if appearance.get("texture_path"):
+        texture_sha = hashlib.sha256(Path(appearance["texture_path"]).read_bytes()).hexdigest()
+        if texture_sha != appearance["texture_sha256"]:
+            raise ValueError("garment texture differs from its recorded hash")
     scale = float(parameters.get("garment_scale", 1.0))
     angle = math.radians(float(parameters.get("garment_rotation_deg", 0.0)))
     # The source is sewn in the X/Z plane; rotate rigidly onto X/Y, retaining
@@ -99,11 +114,11 @@ def load_garment(directory: Path, parameters: dict, start_m: tuple, backend="phy
     translation[2] -= vertices[:, 2].min()
     vertices += translation
     reference += translation
-    return dict(vertices=vertices.astype(np.float32), reference=reference.astype(np.float32), faces=faces,
+    return dict(uv=uv, vertices=vertices.astype(np.float32), reference=reference.astype(np.float32), faces=faces,
                 rest_triangles=rest * scale if rest is not None else None, seam_edges=seams,
                 simulation=config.get("simulation", {}),
                 metadata={"garment_id": manifest["id"], "category": manifest["category"],
-                          "mesh_sha256": mesh_sha, "material_preset": preset,
+                          "mesh_sha256": mesh_sha, "appearance": appearance, "material_preset": preset,
                           "material": material, "physx_material": mapped, "parameters": parameters,
                           "physics_backend": backend,
                           "simulation": config.get("simulation", {}),
@@ -165,6 +180,19 @@ def clothforge_newton_manager():
     return NewtonClothForgeManager
 
 
+def bind_garment_appearance(mesh, garment):
+    """Bind the same textured surface used by live cameras and recorded RGB."""
+    from pxr import UsdGeom, UsdShade, Sdf, Gf, Vt
+    stage = mesh.GetPrim().GetStage()
+    appearance = garment["metadata"]["appearance"]
+    from robot_data_contracts.usd_material import create_material
+    material_path = str(mesh.GetPath().GetParentPath().AppendChild("visualMaterial"))
+    uv = UsdGeom.PrimvarsAPI(mesh).CreatePrimvar("st", Sdf.ValueTypeNames.TexCoord2fArray, "faceVarying")
+    uv.Set(Vt.Vec2fArray.FromNumpy(garment["uv"].reshape(-1, 2)))
+    material = create_material(stage, material_path, appearance)
+    UsdShade.MaterialBindingAPI.Apply(mesh.GetPrim()).Bind(material)
+
+
 def spawn_garment(prim_path: str, garment: dict, backend="physx"):
     """Create the surface body on the current stage, then let Isaac Lab own it."""
     import omni.usd
@@ -207,9 +235,7 @@ def spawn_garment(prim_path: str, garment: dict, backend="physx"):
         )
     physics.func(prim_path + "/physicsMaterial", physics)
     sim_utils.bind_physics_material(prim_path, prim_path + "/physicsMaterial", stage=stage)
-    visual = sim_utils.PreviewSurfaceCfg(diffuse_color=(0.22, 0.42, 0.63), roughness=0.9)
-    visual.func(prim_path + "/visualMaterial", visual)
-    sim_utils.bind_visual_material(mesh.GetPath().pathString, prim_path + "/visualMaterial", stage=stage)
+    bind_garment_appearance(mesh, garment)
     asset = DeformableObject(cfg=DeformableObjectCfg(prim_path=prim_path, spawn=None))
     if backend == "newton":
         from isaaclab_newton.physics import NewtonManager

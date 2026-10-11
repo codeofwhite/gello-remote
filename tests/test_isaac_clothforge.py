@@ -99,3 +99,27 @@ def test_newton_flat_scene_runs_pattern_hook_before_finalization(monkeypatch):
     monkeypatch.setitem(sys.modules, 'isaaclab_newton.physics', SimpleNamespace(NewtonManager=base))
     clothforge_newton_manager().instantiate_builder_from_stage()
     assert events == [('load', None), ('pattern', 'loaded-builder')]
+
+
+def test_uv_uses_rest_pattern_and_is_independent_of_placement(garment):
+    path, _ = garment
+    base = load_garment(path, {}, (0, 0, .8))
+    moved = load_garment(path, {'garment_scale': .5, 'garment_rotation_deg': 90}, (1, 1, .8))
+    assert base['uv'].shape == (2, 3, 2)
+    assert np.all(base['uv'] >= 0) and np.all(base['uv'] <= 1)
+    assert np.array_equal(base['uv'], moved['uv'])
+    assert base['uv'][0] == pytest.approx(np.array([[0, 0], [1, 0], [.5, 1]]))
+    assert base['uv'][1] == pytest.approx(np.array([[0, 0], [.5, 1], [1, 0]]))
+
+
+def test_texture_fingerprint_and_appearance_are_recorded(garment):
+    path, _ = garment
+    texture = path / 'existing.png'
+    texture.write_bytes(b'texture')
+    appearance = dict(texture='cotton', color='#ffffff', roughness=.4,
+        texture_path=str(texture), texture_sha256=hashlib.sha256(texture.read_bytes()).hexdigest())
+    result = load_garment(path, {'appearance': appearance}, (0, 0, .8))
+    assert result['metadata']['appearance'] == appearance
+    texture.write_bytes(b'changed')
+    with pytest.raises(ValueError, match='texture differs'):
+        load_garment(path, {'appearance': appearance}, (0, 0, .8))
