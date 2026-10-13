@@ -45,6 +45,7 @@ STREAM_WIDTH = 960
 STREAM_HEIGHT = 720
 STREAM_SCENE_PRIMS = ("/World/Franka", "/World/defaultGroundPlane", "/World/Light")
 ISAAC_SCENE_IDS = (
+    "clothforge_free_drop",
     "franka_empty",
     "rigid_pick_place",
     "rigid_cube_lift",
@@ -149,7 +150,7 @@ PREVIEW_WIDTH = 320
 PREVIEW_HEIGHT = 240
 PREVIEW_JPEG_QUALITY = 70
 PREVIEW_MAX_JPEG_BYTES = 256 * 1024
-CONTROL_SOURCES = ("keyboard", "gello", "openpi", "trajectory")
+CONTROL_SOURCES = ("keyboard", "gello", "openpi", "trajectory", "scripted")
 KEYBOARD_KEYS = (
     "KeyW", "KeyS", "KeyA", "KeyD", "KeyQ", "KeyE",
     "KeyZ", "KeyX", "KeyT", "KeyG", "KeyC", "KeyV",
@@ -1521,6 +1522,49 @@ def _pump_kit_frame(simulation_app: object, settings: object | None = None) -> N
         settings.set_bool(play_setting, True if previous_play_flag is None else bool(previous_play_flag))
 
 
+class RuntimePerformance:
+    """Opt-in synchronized stage timings; production never synchronizes for profiling."""
+
+    def __init__(self, path, synchronize, mode):
+        self.path, self.synchronize, self.mode = path, synchronize, mode
+        self.started = time.perf_counter()
+        self.stages = {}
+
+    @contextmanager
+    def measure(self, name):
+        if self.path is None:
+            yield
+            return
+        self.synchronize()
+        started = time.perf_counter()
+        try:
+            yield
+        finally:
+            self.synchronize()
+            elapsed = (time.perf_counter() - started) * 1000
+            stage = self.stages.setdefault(name, {"count": 0, "total_ms": 0., "recent_ms": deque(maxlen=240)})
+            stage["count"] += 1
+            stage["total_ms"] += elapsed
+            stage["recent_ms"].append(elapsed)
+
+    def publish(self, physics_steps, sim_dt):
+        if self.path is None:
+            return None
+        wall = time.perf_counter() - self.started
+        stages = {}
+        for name, stage in self.stages.items():
+            samples = sorted(stage["recent_ms"])
+            stages[name] = {"count": stage["count"], "total_ms": round(stage["total_ms"], 3),
+                            "mean_ms": round(stage["total_ms"] / stage["count"], 3),
+                            "recent_p95_ms": round(samples[math.ceil(.95 * len(samples)) - 1], 3)}
+        result = {"mode": self.mode, "diagnostic_cuda_synchronization": True,
+                  "wall_seconds": wall, "physics_steps": physics_steps,
+                  "physics_steps_per_second": physics_steps / wall,
+                  "real_time_factor": physics_steps * sim_dt / wall, "stages": stages}
+        self.path.write_text(json.dumps(result, indent=2))
+        return result
+
+
 class TelemetryStore:
     """Share simulator observations with WebSocket handler threads."""
 
@@ -2222,6 +2266,8 @@ def _parse_args() -> tuple[argparse.Namespace, object]:
         default=DEFAULT_PREVIEW_FPS,
         help="base/top/side/wrist browser preview frequency",
     )
+    parser.add_argument("--runtime-performance-mode", choices=("legacy", "scheduled", "physics-only"), default="scheduled", help="Newton cloth scheduling; legacy/physics-only are diagnostic comparisons")
+    parser.add_argument("--runtime-performance-report", type=Path, help="opt-in synchronized stage timing report (diagnostic overhead)")
     parser.add_argument("--max_joint_speed", type=float, default=1.0, help="per-joint target slew limit [rad/s]")
     parser.add_argument("--gello_timeout", type=float, default=0.3, help="watchdog timeout [s]")
     parser.add_argument(
@@ -2268,9 +2314,9 @@ def _parse_args() -> tuple[argparse.Namespace, object]:
         validate_environment(args.environment_appearance)
         from robot_data_contracts.camera_lighting import validate_resolved
         validate_resolved(args.camera_lighting)
-        if args.camera_lighting is not None and args.scene not in {'bimanual_tabletop_v17', 'bimanual_tabletop_v17_cloth', 'bimanual_tabletop_v17_clothforge'}:
+        if args.camera_lighting is not None and args.scene not in {'bimanual_tabletop_v17', 'bimanual_tabletop_v17_cloth', 'bimanual_tabletop_v17_clothforge', 'clothforge_free_drop'}:
             raise ValueError('相机光照控制当前支持双臂实验台 v17')
-        if any(args.environment_appearance.values()) and args.scene not in {'bimanual_tabletop_v17', 'bimanual_tabletop_v17_cloth', 'bimanual_tabletop_v17_clothforge'}:
+        if any(args.environment_appearance.values()) and args.scene not in {'bimanual_tabletop_v17', 'bimanual_tabletop_v17_cloth', 'bimanual_tabletop_v17_clothforge', 'clothforge_free_drop'}:
             raise ValueError('环境外观当前支持双臂实验台 v17')
     except ValueError as exc:
         parser.error(str(exc))
@@ -2307,6 +2353,11 @@ def _parse_args() -> tuple[argparse.Namespace, object]:
         args.visual_demo_output = args.visual_demo_output.expanduser().resolve()
         if args.visual_demo_output.exists() and any(args.visual_demo_output.iterdir()):
             parser.error("visual demo output directory must be absent or empty")
+    elif args.scene == "clothforge_free_drop":
+        if args.control_source != "scripted" or args.physics_backend != "newton" or not args.enable_cameras or args.clothforge_dir is None:
+            parser.error("clothforge_free_drop requires scripted / Newton / cameras / garment directory")
+        if args.visual_style != "dual_franka_tabletop":
+            parser.error("clothforge_free_drop reuses the v17 workstation visual style")
     elif args.scene in {"bimanual_tabletop_v17", "bimanual_tabletop_v17_cloth", "bimanual_tabletop_v17_clothforge"}:
         if args.control_source != "keyboard":
             parser.error("bimanual_tabletop_v17 requires keyboard control")
@@ -2318,6 +2369,8 @@ def _parse_args() -> tuple[argparse.Namespace, object]:
             parser.error("bimanual_tabletop_v17 requires --enable_cameras")
     elif args.visual_style != "baseline":
         parser.error("--visual-style requires --visual-demo-output")
+    if args.control_source == "scripted" and args.scene != "clothforge_free_drop":
+        parser.error("scripted observation requires clothforge_free_drop")
     args.visual_asset = None
     workstation_paths = (
         args.workstation_usd,
@@ -2440,7 +2493,7 @@ def _parse_args() -> tuple[argparse.Namespace, object]:
             "--rendering_mode does not match renderer profile: "
             f"{args.rendering_mode!r} != {args.renderer_profile['rendering_mode']!r}"
         )
-    if args.scene in {"bimanual_tabletop_v17", "bimanual_tabletop_v17_cloth", "bimanual_tabletop_v17_clothforge"}:
+    if args.scene in {"bimanual_tabletop_v17", "bimanual_tabletop_v17_cloth", "bimanual_tabletop_v17_clothforge", "clothforge_free_drop"}:
         # Retain the preview's fixed photographic exposure with the selected live renderer.
         imaging = args.camera_profile["engine_overrides"]["isaac_sim"]["imaging"]
         live_overrides = {
@@ -2567,6 +2620,9 @@ def _newton_physics_cfg(solver: str, use_cuda_graph: bool, garment_config=None) 
 
 
 def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
+    if args.scene == "clothforge_free_drop":
+        from .isaac_cloth_drop import run_cloth_drop
+        return run_cloth_drop(args, simulation_app)
     import importlib.metadata
 
     import carb
@@ -2633,7 +2689,7 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
         if clothforge_scene:
             from .isaac_clothforge import newton_garment_config
             preset = args.clothforge_params.get("material_preset", "medium")
-            garment_config = newton_garment_config(args.clothforge_dir, preset)
+            garment_config = newton_garment_config(args.clothforge_dir, preset, args.clothforge_params)
             garment_config["simulation"]["iterations"] = int(args.clothforge_params.get("cloth_iterations", 30))
             garment_config["material"]["friction"] = args.clothforge_params.get("friction", garment_config["material"]["friction"])
         newton_physics = _newton_physics_cfg(newton_solver, args.newton_cuda_graph, garment_config)
@@ -3630,6 +3686,7 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
         work_surface_top_m=work_surface_top_m,
         scene_geometry=scene_geometry,
         **scene_status,
+        simulation_numerics=(dict(garment_config["simulation"]) if args.physics_backend == "newton" and garment_config else None),
     )
     recording = RecordingCommandStore()
     views = ViewCommandStore()
@@ -3673,6 +3730,7 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
             "physics_backend": args.physics_backend,
             "physics_solver": newton_solver if args.physics_backend == "newton" else "physx",
             "physics_substeps": newton_physics.num_substeps if newton_physics is not None else 1,
+            "simulation_numerics": dict(garment_config["simulation"]) if args.physics_backend == "newton" and garment_config else None,
             "control_hz": args.control_hz,
             "control_source_options": [
                 "browser_se3_keyboard",
@@ -4692,9 +4750,16 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
         stream_fps=args.stream_fps,
         control_hz=args.control_hz,
     )
+    scheduled_runtime = args.physics_backend == "newton" and clothforge_scene and args.runtime_performance_mode != "legacy"
+    physics_only = scheduled_runtime and args.runtime_performance_mode == "physics-only"
+    performance = RuntimePerformance(args.runtime_performance_report,
+        lambda: torch.cuda.synchronize(sim.device) if str(sim.device).startswith("cuda") else None,
+        args.runtime_performance_mode)
+    right_hand_body_index = robot_right.find_bodies("panda_hand")[0][0] if robot_right is not None else None
     physics_step = 0
     control_step = 0
     visual_frame_count = 0
+    last_camera_capture_step = None
     visual_total_control_steps = max(
         2, int(math.ceil(args.smoke_steps / control_decimation))
     )
@@ -4893,9 +4958,10 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                     ):
                         selected_controller = controller_right if active_arm == "right" else controller
                         selected_safe = safe_right if active_arm == "right" else safe_command
-                        requested_joint_targets = keyboard_joint_targets(
-                            keyboard_sample, selected_safe.joint_targets, arm=active_arm
-                        )
+                        with performance.measure("ik"):
+                            requested_joint_targets = keyboard_joint_targets(
+                                keyboard_sample, selected_safe.joint_targets, arm=active_arm
+                            )
                         selected_controller.submit(
                             GelloCommand(
                                 session_id="browser-keyboard-ik",
@@ -4935,16 +5001,28 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                 )
                 images = None
                 capture_timestamp_ns = None
-                if dataset_due or preview_due or visual_demo_due:
+                if physics_only and dataset_due:
+                    raise RuntimeError("physics-only diagnostics cannot record camera Episodes")
+                if not physics_only and (dataset_due or preview_due or visual_demo_due):
                     assert record_cameras
                     if visual_demo_due:
                         apply_recorded_visual_pose()
-                    for camera in record_cameras.values():
-                        camera.update(dt=sim_dt)
-                    images = {
-                        name: camera.data.output["rgb"].torch[0].detach().cpu().numpy()
-                        for name, camera in record_cameras.items()
-                    }
+                    if scheduled_runtime:
+                        # Flush native robot/cloth transforms before sensors snapshot the stage.
+                        # Camera renderers drive their own RTX render; no extra Kit viewport tick.
+                        with performance.measure("capture_scene_sync"):
+                            sim.render(skip_app_pumping=True)
+                    with performance.measure("camera_capture"):
+                        # Capture runs at control cadence. Advance the sensor clock by
+                        # all elapsed physics ticks, not a single dt (~12x too small).
+                        camera_dt = (physics_step - last_camera_capture_step) * sim_dt if last_camera_capture_step is not None else 0.0
+                        for camera in record_cameras.values():
+                            camera.update(dt=camera_dt if scheduled_runtime else sim_dt)
+                        last_camera_capture_step = physics_step
+                        images = {
+                            name: camera.data.output["rgb"].torch[0].detach().cpu().numpy()
+                            for name, camera in record_cameras.items()
+                        }
                     capture_timestamp_ns = time.monotonic_ns()
                 if preview_due and images is not None:
                     previews.submit(
@@ -5087,66 +5165,79 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                 )
                 control_step += 1
 
-            sim.step()
-            robot.update(sim_dt)
-            if robot_right is not None:
-                robot_right.update(sim_dt)
-            if task_object is not None:
-                task_object.update(sim_dt)
-            if cloth_object is not None:
-                # DeformableObjectData only re-reads the PhysX buffers once its
-                # timestamp is advanced, so this is what makes cloth state live.
-                cloth_object.update(sim_dt)
+            with performance.measure("physics" if scheduled_runtime else "physics_with_render"):
+                sim.step(render=not scheduled_runtime)
+                robot.update(sim_dt)
+                if robot_right is not None:
+                    robot_right.update(sim_dt)
+                if task_object is not None:
+                    task_object.update(sim_dt)
+                if cloth_object is not None:
+                    # DeformableObjectData only re-reads the PhysX buffers once its
+                    # timestamp is advanced, so this is what makes cloth state live.
+                    cloth_object.update(sim_dt)
             if args.physics_backend == "newton" and clothforge_scene and physics_step in {0, 1, 9, 49}:
                 from .isaac_clothforge import newton_workstation_state
                 print("NEWTON_WORKSTATION_STATE " + json.dumps(newton_workstation_state(
                     {"left": robot, "right": robot_right}, f"step-{physics_step + 1}")),
                     file=sys.__stderr__, flush=True)
-            if args.smoke_steps == 0 and physics_step % stream_decimation == 0:
-                _pump_kit_frame(simulation_app)
-            actual_joint_positions = backend.current_joint_positions()
-            finger_positions = backend.current_gripper_positions()
-            tracking_error = max(
-                abs(actual - target) for actual, target in zip(actual_joint_positions, safe_command.joint_targets)
-            )
-            tcp_z_m = float(robot.data.body_pos_w.torch[0, hand_body_index, 2].item())
-            object_position_m = (
-                task_object.data.root_pos_w.torch[0].detach().cpu().tolist()
-                if task_object is not None
-                else None
-            )
-            telemetry.update(
-                actual_joint_positions=list(actual_joint_positions),
-                finger_positions=list(finger_positions),
-                tracking_error_max_rad=round(tracking_error, 6),
-                tcp_z_m=round(tcp_z_m, 4),
-                tcp_surface_clearance_m=(
-                    round(tcp_z_m - work_surface_top_m, 4)
-                    if work_surface_top_m is not None
-                    else None
-                ),
-                object_position_m=object_position_m,
-                physics_step=physics_step,
-            )
-            if bimanual_cloth and physics_step % stream_decimation == 0:
-                cloth_positions = cloth_object.data.nodal_pos_w.torch[0]
-                telemetry.update(
-                    cloth_center_m=cloth_positions.mean(dim=0).detach().cpu().tolist(),
-                    cloth_z_range_m=[float(cloth_positions[:, 2].min().item()),
-                                     float(cloth_positions[:, 2].max().item())],
-                    cloth_node_count=int(cloth_positions.shape[0]),
-                )
-            if backend_right is not None:
-                telemetry.update(dual_arm=True, active_arm=active_arm,
-                    right_actual_joint_positions=list(backend_right.current_joint_positions()),
-                    right_finger_positions=list(backend_right.current_gripper_positions()),
-                    left_ee_pose=robot.data.body_pose_w.torch[0, hand_body_index].detach().cpu().tolist(),
-                    right_ee_pose=robot_right.data.body_pose_w.torch[0, robot_right.find_bodies("panda_hand")[0][0]].detach().cpu().tolist(),
-                    right_control=controller_right.status())
+            if args.smoke_steps == 0 and physics_step % stream_decimation == 0 and not physics_only:
+                with performance.measure("viewport"):
+                    if scheduled_runtime:
+                        sim.render()
+                    else:
+                        _pump_kit_frame(simulation_app)
+            telemetry_due = not scheduled_runtime or physics_step % control_decimation == 0
+            if telemetry_due:
+                with performance.measure("telemetry"):
+                    actual_joint_positions = backend.current_joint_positions()
+                    finger_positions = backend.current_gripper_positions()
+                    tracking_error = max(
+                        abs(actual - target) for actual, target in zip(actual_joint_positions, safe_command.joint_targets)
+                    )
+                    tcp_z_m = float(robot.data.body_pos_w.torch[0, hand_body_index, 2].item())
+                    object_position_m = (
+                        task_object.data.root_pos_w.torch[0].detach().cpu().tolist()
+                        if task_object is not None
+                        else None
+                    )
+                    telemetry.update(
+                        actual_joint_positions=list(actual_joint_positions),
+                        finger_positions=list(finger_positions),
+                        tracking_error_max_rad=round(tracking_error, 6),
+                        tcp_z_m=round(tcp_z_m, 4),
+                        tcp_surface_clearance_m=(
+                            round(tcp_z_m - work_surface_top_m, 4)
+                            if work_surface_top_m is not None
+                            else None
+                        ),
+                        object_position_m=object_position_m,
+                        physics_step=physics_step,
+                    )
+                    if bimanual_cloth and (scheduled_runtime or physics_step % stream_decimation == 0):
+                        cloth_positions = cloth_object.data.nodal_pos_w.torch[0]
+                        telemetry.update(
+                            cloth_center_m=cloth_positions.mean(dim=0).detach().cpu().tolist(),
+                            cloth_z_range_m=[float(cloth_positions[:, 2].min().item()),
+                                             float(cloth_positions[:, 2].max().item())],
+                            cloth_node_count=int(cloth_positions.shape[0]),
+                        )
+                    if backend_right is not None:
+                        telemetry.update(dual_arm=True, active_arm=active_arm,
+                            right_actual_joint_positions=list(backend_right.current_joint_positions()),
+                            right_finger_positions=list(backend_right.current_gripper_positions()),
+                            left_ee_pose=robot.data.body_pose_w.torch[0, hand_body_index].detach().cpu().tolist(),
+                            right_ee_pose=robot_right.data.body_pose_w.torch[0, right_hand_body_index].detach().cpu().tolist(),
+                            right_control=controller_right.status())
             physics_step += 1
+            if telemetry_due:
+                report = performance.publish(physics_step, sim_dt)
+                if report is not None:
+                    telemetry.update(runtime_performance=report)
             if args.smoke_steps and physics_step >= args.smoke_steps:
                 break
     finally:
+        performance.publish(physics_step, sim_dt)
         if writer is not None and writer.is_recording:
             writer.discard()
         if services_entered:

@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 
 
-def newton_garment_config(directory, preset):
+def newton_garment_config(directory, preset, numerical=None):
     """Map ClothForge's absolute damping to the loaded Newton contact law."""
     import inspect
     from importlib.metadata import version
@@ -20,6 +20,16 @@ def newton_garment_config(directory, preset):
         "topological_contact_filter_threshold": 1, "collision_detection_interval": 1,
     }})
     settings = config["simulation"]
+    numerical = numerical or {}
+    for key, target, low, high in (("cloth_substeps", "substeps", 1, 16),
+                                  ("cloth_collision_interval", "collision_detection_interval", 0, 64),
+                                  ("cloth_iterations", "iterations", 4, 64)):
+        if key in numerical:
+            value = numerical[key]
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or int(value) != value or not low <= value <= high:
+                raise ValueError(f"{key}: expected integer in [{low}, {high}]")
+            settings[target] = int(value)
+    settings["simulation_preset"] = numerical.get("simulation_preset", "custom")
     damping = settings["soft_contact_kd"]
     # The standalone 1.4 worker uses kd [N s/m]; the Isaac bundled law
     # multiplies kd by ke. Preserve the physical damping, not the raw number.
@@ -117,7 +127,7 @@ def load_garment(directory: Path, parameters: dict, start_m: tuple, backend="phy
         raise ValueError("material_preset= must be light, medium or heavy")
     config = json.loads((directory / f"config-{preset}.json").read_text())
     if backend == "newton":
-        config = newton_garment_config(directory, preset)
+        config = newton_garment_config(directory, preset, parameters)
         config["simulation"]["iterations"] = int(parameters.get("cloth_iterations", 30))
     material = config["material"]
     material = {**material, **{key: parameters[key] for key in
@@ -220,12 +230,14 @@ def restore_newton_pattern(builder, garment, particle_offsets):
     }), flush=True)
 
 
-def clothforge_newton_manager():
+def clothforge_newton_manager(*, coupled=True):
     """Run registered pattern hooks before finalizing the flat scene builder."""
     from isaaclab_contrib.deformable.coupled_mjwarp_vbd_manager import NewtonCoupledMJWarpVBDManager
+    from isaaclab_contrib.deformable.vbd_manager import NewtonVBDManager
     from isaaclab_newton.physics import NewtonManager
+    base = NewtonCoupledMJWarpVBDManager if coupled else NewtonVBDManager
 
-    class NewtonClothForgeManager(NewtonCoupledMJWarpVBDManager):
+    class NewtonClothForgeManager(base):
         @classmethod
         def instantiate_builder_from_stage(cls):
             super().instantiate_builder_from_stage()
