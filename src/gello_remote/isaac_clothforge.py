@@ -10,12 +10,32 @@ import numpy as np
 
 
 def newton_garment_config(directory, preset):
-    """Use the existing ClothForge contact defaults and contact refresh profile."""
+    """Map ClothForge's absolute damping to the loaded Newton contact law."""
+    import inspect
+    from importlib.metadata import version
+    from newton._src.solvers.vbd.rigid_vbd_kernels import _compute_body_particle_contact_force
     from clothforge.repair import resolve_config
     source = json.loads((Path(directory) / f"config-{preset}.json").read_text())
-    return resolve_config(source, {"id": "studio-workstation", "overrides": {
+    config = resolve_config(source, {"id": "studio-workstation", "overrides": {
         "topological_contact_filter_threshold": 1, "collision_detection_interval": 1,
     }})
+    settings = config["simulation"]
+    damping = settings["soft_contact_kd"]
+    # The standalone 1.4 worker uses kd [N s/m]; the Isaac bundled law
+    # multiplies kd by ke. Preserve the physical damping, not the raw number.
+    law = inspect.getsource(_compute_body_particle_contact_force.func)
+    if "damping_coeff = kd * ke" in law:
+        convention = "stiffness_scaled"
+        settings["soft_contact_kd"] = damping / settings["soft_contact_ke"]
+    elif "(kd / dt)" in law:
+        convention = "absolute"
+    else:
+        raise RuntimeError("Unsupported Newton body-particle damping convention")
+    settings["contact_damping_mapping"] = {
+        "newton_version": version("newton"), "convention": convention,
+        "absolute_damping_ns_per_m": damping, "solver_kd": settings["soft_contact_kd"],
+    }
+    return config
 
 
 def newton_hand_jacobian(robot):
@@ -51,6 +71,41 @@ def newton_hand_jacobian(robot):
             quat_conjugate(poses[1][3:].unsqueeze(0))))[0] / (2 * eps)
         columns.append(torch.cat([linear, angular]))
     return torch.stack(columns, dim=1).unsqueeze(0)
+
+
+def newton_workstation_state(robots, phase):
+    """Compare native link poses with articulation data and rendered Fabric poses."""
+    from isaaclab_newton.physics import NewtonManager
+
+    model = NewtonManager.get_model()
+    native = NewtonManager.get_state_0().body_q.numpy()
+    result = {"phase": phase, "arms": {}}
+    from isaaclab.physics import PhysicsManager
+    manager = PhysicsManager._cfg.solver_cfg.class_type
+    rigid = manager._rigid_solver
+    result["joint_target_ke"] = model.joint_target_ke.numpy().tolist()
+    result["rigid_actuator_gains"] = rigid.mjw_model.actuator_gainprm.numpy()[..., 0].tolist()
+    for side, robot in robots.items():
+        prefix = robot.cfg.prim_path + "/"
+        indices = [i for i, label in enumerate(model.body_label) if label.startswith(prefix)]
+        poses = native[indices]
+        joints = robot.data.joint_pos.torch.detach().cpu().numpy()
+        arm = {"native_links": len(indices), "finite": bool(np.isfinite(poses).all() and np.isfinite(joints).all()),
+               "joint_positions_rad": joints.tolist(),
+               "native_xyz_min_m": poses[:, :3].min(axis=0).tolist(),
+               "native_xyz_max_m": poses[:, :3].max(axis=0).tolist()}
+        hand = next(i for i in indices if model.body_label[i].endswith("/panda_hand"))
+        hand_index = robot.find_bodies("panda_hand")[0][0]
+        arm["native_hand_pose"] = native[hand].tolist()
+        arm["asset_hand_pose"] = robot.data.body_pose_w.torch[0, hand_index].detach().cpu().tolist()
+        fabric = NewtonManager._usdrt_stage
+        if fabric is not None:
+            prim = fabric.GetPrimAtPath(model.body_label[hand])
+            matrix = prim.GetAttribute("omni:fabric:worldMatrix")
+            if matrix.IsValid() and matrix.HasValue():
+                arm["fabric_hand_world_matrix"] = np.asarray(matrix.Get()).tolist()
+        result["arms"][side] = arm
+    return result
 
 
 def load_garment(directory: Path, parameters: dict, start_m: tuple, backend="physx") -> dict:

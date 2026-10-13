@@ -2501,8 +2501,10 @@ def _newton_physics_cfg(solver: str, use_cuda_graph: bool, garment_config=None) 
     from isaaclab_newton.physics import MJWarpSolverCfg, NewtonCfg
 
     rigid_solver_cfg = MJWarpSolverCfg(
-        njmax=40,
-        nconmax=20,
+        # Two articulated arms, finger constraints and cloth contacts exceed
+        # the small rigid-only budget (the workstation needs >=74 rows).
+        njmax=512 if garment_config else 40,
+        nconmax=128 if garment_config else 20,
         ls_iterations=20,
         cone="pyramidal",
         impratio=1,
@@ -2557,9 +2559,9 @@ def _newton_physics_cfg(solver: str, use_cuda_graph: bool, garment_config=None) 
             soft_contact_kd=settings.get("soft_contact_kd", 1e-5),
             soft_contact_mu=material.get("friction", .5),
         ),
-        # ClothForge runs inside the worker's existing physics loop. Use one
-        # VBD step per tick instead of the rigid-only 10x subdivision.
-        num_substeps=1 if garment_config else 10,
+        # Preserve the garment's contact integration profile. A single coarse
+        # tick leaves the explicit rigid/cloth reactions poorly resolved.
+        num_substeps=int(settings.get("substeps", 10)),
         use_cuda_graph=use_cuda_graph,
     )
 
@@ -3187,6 +3189,12 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
             )
         if not dual_franka_tabletop:
             robot.reset()
+        if args.physics_backend == "newton" and clothforge_scene:
+            # Reset writes joint coordinates; contacts and graph warmup read
+            # body poses. Recompute FK before either sees the authored pose.
+            from isaaclab_newton.physics import NewtonManager
+            NewtonManager.forward()
+            NewtonManager._mark_state_dirty()
         robot.update(sim_dt)
         if robot_right is not None:
             robot_right.update(sim_dt)
@@ -3206,6 +3214,12 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
             )
             cloth_object.reset()
             cloth_object.update(sim_dt)
+        if args.physics_backend == "newton" and clothforge_scene:
+            # Two-way contact damping computes velocity from the two buffers.
+            # A reset must update the previous state too, otherwise the old
+            # authored pose becomes a fictitious high-speed contact motion.
+            from isaaclab_newton.physics import NewtonManager
+            NewtonManager.get_state_1().assign(NewtonManager.get_state_0())
 
     visual_link_pose_ops: dict[tuple[str, str], object] = {}
 
@@ -3263,6 +3277,10 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
 
     reset_task_assets()
     apply_recorded_visual_pose()
+    if args.physics_backend == "newton" and clothforge_scene:
+        from .isaac_clothforge import newton_workstation_state
+        print("NEWTON_WORKSTATION_STATE " + json.dumps(newton_workstation_state(
+            {"left": robot, "right": robot_right}, "initialized")), file=sys.__stderr__, flush=True)
     if dual_franka_tabletop and args.visual_asset["manifest_id"] in {"bimanual_tabletop_v16", "bimanual_tabletop_v17"}:
         import omni.usd
         from pxr import Usd, UsdGeom
@@ -5079,6 +5097,11 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                 # DeformableObjectData only re-reads the PhysX buffers once its
                 # timestamp is advanced, so this is what makes cloth state live.
                 cloth_object.update(sim_dt)
+            if args.physics_backend == "newton" and clothforge_scene and physics_step in {0, 1, 9, 49}:
+                from .isaac_clothforge import newton_workstation_state
+                print("NEWTON_WORKSTATION_STATE " + json.dumps(newton_workstation_state(
+                    {"left": robot, "right": robot_right}, f"step-{physics_step + 1}")),
+                    file=sys.__stderr__, flush=True)
             if args.smoke_steps == 0 and physics_step % stream_decimation == 0:
                 _pump_kit_frame(simulation_app)
             actual_joint_positions = backend.current_joint_positions()
