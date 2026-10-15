@@ -177,6 +177,9 @@ class TeleopServer:
         self.current_episode: int | None = None
         self.current_task = ""
         self.stream_fps = 0.0
+        self.tick_ms = 0.0
+        self.applied_sequence = -1
+        self.observation_control_sequence = -1
         self._fps_window_started = time.perf_counter()
         self._fps_window_ticks = 0
         self.gello_sequence: int | None = None
@@ -229,6 +232,7 @@ class TeleopServer:
                 f"{arm}/{name}" for arm in ("left", "right") for name in operator_command_names
             ]
         writer_class = DualFrankaEpisodeWriter if self.dual_arm else FrankaEpisodeWriter
+        replay = self._replay_metadata() if not self.dual_arm else None
         self.recorder = writer_class(
             args.data_dir,
             fps=args.control_fps,
@@ -243,6 +247,7 @@ class TeleopServer:
             operator_command_names=operator_command_names,
             camera_names=self.task_scene.camera_names,
             run_metadata={
+                "offline_replay": replay,
                 "robot": (
                     "Two Genesis built-in Franka Panda with original parallel grippers"
                     if self.dual_arm
@@ -273,6 +278,37 @@ class TeleopServer:
                 "dependency_packages": ["genesis-world", "numpy", "opencv-python"],
             },
         )
+
+    def _replay_metadata(self) -> dict:
+        import hashlib
+        import genesis as gs
+        from franka_only.scenes import to_numpy
+        cameras = {name: getattr(self.task_scene, name + '_camera') for name in self.task_scene.camera_names}
+        robot_xml = Path(gs.__file__).resolve().parent / 'assets' / self.task_scene.franka.morph.file
+        if not robot_xml.is_file():
+            robot_xml = Path(self.task_scene.franka.morph.file).resolve()
+        replay = {'format_version': 1, 'units': 'metres', 'up_axis': 'Z',
+                  'quaternion_order': 'wxyz', 'camera_axes': 'OpenGL +X right +Y up -Z forward',
+                  'robot_base_position_m': self.task_scene.robot_base_position.astype(float).tolist(),
+                  'robot_link_names': [link.name for link in self.task_scene.franka.links],
+                  'robot_asset': str(robot_xml), 'robot_asset_sha256': hashlib.sha256(robot_xml.read_bytes()).hexdigest(),
+                  'physics_backend': getattr(self.task_scene, 'contact_backend', 'genesis_rigid'),
+                  'cameras': {name: {'intrinsics': to_numpy(cam.intrinsics).reshape(3,3).tolist(),
+                                    'resolution': [self.args.width, self.args.height],
+                                    'pose_array': 'camera_to_world_' + name} for name,cam in cameras.items()}}
+        if hasattr(self.task_scene, 'replay_topology'):
+            replay['cloth'] = self.task_scene.replay_topology()
+        return replay
+
+    def _replay_frame(self) -> dict:
+        from franka_only.scenes import to_numpy
+        robot = self.task_scene.franka
+        values = {'robot_link_poses': np.concatenate([to_numpy(robot.get_links_pos()),
+                    to_numpy(robot.get_links_quat())],axis=-1).astype(np.float32)}
+        for name in self.task_scene.camera_names:
+            camera = getattr(self.task_scene, name + '_camera')
+            values['camera_to_world_' + name] = to_numpy(camera.transform).reshape(4,4).astype(np.float64)
+        return values
 
     def _operator_command_layouts(self) -> dict[str, list[str]]:
         """Name the operator command channels actually used by this arm topology."""
@@ -657,6 +693,7 @@ class TeleopServer:
         }
 
     def control_tick(self) -> bytes:
+        tick_started = time.perf_counter()
         gello_fresh = (
             self.gello_received_at is not None
             and time.monotonic() - self.gello_received_at <= self.args.gello_timeout
@@ -717,10 +754,13 @@ class TeleopServer:
             control_timestamp_ns = -1
             control_receive_timestamp_ns = -1
             requested_action = action
+        self.observation_control_sequence = self.applied_sequence
         observation = self.task_scene.observe()
         images = self.task_scene.render()
+        replay_values = self._replay_frame() if self.recorder.is_recording and not self.dual_arm else {}
         capture_timestamp_ns = time.monotonic_ns()
         self.task_scene.apply_action(action, self.args.physics_steps_per_control)
+        self.applied_sequence = int(control_sequence)
         if self.recorder.is_recording:
             self.recorder.add_frame(
                 images=images,
@@ -741,7 +781,7 @@ class TeleopServer:
                 capture_timestamp_ns=capture_timestamp_ns,
                 cloth_particles=observation.cloth_particles,
                 cloth_particle_velocities=observation.cloth_particle_velocities,
-                extra_arrays=dual_provenance,
+                extra_arrays={**dual_provenance, **replay_values},
             )
         self.sim_time += self.args.sim_dt * self.args.physics_steps_per_control
         mosaic = self._compose_mosaic(images)
@@ -759,6 +799,7 @@ class TeleopServer:
             self.stream_fps = self._fps_window_ticks / elapsed
             self._fps_window_ticks = 0
             self._fps_window_started = now
+        self.tick_ms = (time.perf_counter() - tick_started) * 1000
         return jpeg.tobytes()
 
     def _compose_mosaic(self, images: dict[str, np.ndarray]) -> np.ndarray:
@@ -867,7 +908,9 @@ class TeleopServer:
             "episode": self.current_episode,
             "frames": self.recorder.frame_count,
             "task": self.current_task,
-            "metrics": self.task_scene.status_metrics(),
+            "metrics": {**self.task_scene.status_metrics(), "control_tick_ms": round(self.tick_ms, 1),
+                        "physics_backend": getattr(self.task_scene, "contact_backend", "genesis_rigid")},
+            "observation_control_sequence": self.observation_control_sequence,
             "stream_fps": self.stream_fps,
             "control_mode": self.args.control_source,
             "arm_ids": list(self.arm_ids),
@@ -970,8 +1013,10 @@ async def collector_loop(server: TeleopServer) -> None:
                 except websockets.exceptions.ConnectionClosed:
                     server.clients.discard(client)
         remaining = target_period - (time.perf_counter() - started)
-        if remaining > 0:
-            await asyncio.sleep(remaining)
+        # An overrun still needs a timer yield: sleep(0) alone can reschedule
+        # the synchronous simulation ahead of pending WebSocket I/O repeatedly.
+        # This gives the selector a poll between ticks without changing sim_dt.
+        await asyncio.sleep(max(0.001, remaining))
 
 
 async def serve(server: TeleopServer) -> None:
