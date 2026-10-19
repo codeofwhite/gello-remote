@@ -69,7 +69,11 @@ class IsaacLabFrankaBackend(FrankaBackend):
     _ARM_JOINT_NAMES = tuple(f"panda_joint{index}" for index in range(1, 8))
     _FINGER_JOINT_PATTERN = "panda_finger_joint.*"
 
-    def __init__(self, articulation: Any, *, device: str) -> None:
+    def __init__(self, articulation: Any, *, device: str, robot_model: str = "panda") -> None:
+        if robot_model not in {"panda", "fr3"}:
+            raise ValueError("robot_model must be panda or fr3")
+        self._ARM_JOINT_NAMES = tuple(f"{robot_model}_joint{i}" for i in range(1, 8))
+        self._FINGER_JOINT_PATTERN = f"{robot_model}_finger_joint.*"
         try:
             import torch
         except ImportError as exc:
@@ -78,7 +82,7 @@ class IsaacLabFrankaBackend(FrankaBackend):
         joint_ids, joint_names = articulation.find_joints(list(self._ARM_JOINT_NAMES), preserve_order=True)
         if tuple(joint_names) != self._ARM_JOINT_NAMES or len(joint_ids) != FRANKA_ARM_DOF:
             raise RuntimeError(
-                "Expected Isaac Lab Franka joints panda_joint1 through panda_joint7 in order; "
+                f"Expected ordered {robot_model} joints1 through7; "
                 f"found {joint_names!r}"
             )
         finger_ids, finger_names = articulation.find_joints(self._FINGER_JOINT_PATTERN, preserve_order=True)

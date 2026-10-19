@@ -984,7 +984,7 @@ def test_process_request_serves_runtime_stream_config() -> None:
     connection = SimpleNamespace(protocol=LegacyProtocol())
     request = SimpleNamespace(path="/teleop-config.json", headers={})
     server = GelloWebServer(
-        object(),
+        SimpleNamespace(status=lambda: {"joint_targets": [0.]*7}),
         TelemetryStore(),
         host="127.0.0.1",
         port=18081,
@@ -1134,3 +1134,42 @@ def test_v5_camera_profile_keeps_original_views_and_nominal_calibration():
     assert extended['engine_overrides'] == original['engine_overrides']
     assert extended['roles'] == original['roles']
     assert extended['match_level'] == 'nominal_pending_intrinsics'
+
+
+def test_fr3_real_wrist_mounts_and_three_saved_streams():
+    from gello_remote.isaaclab_gello import _fr3_wrist_camera_specs, _recording_camera_map, _recording_images
+    root = Path(__file__).resolve().parents[2] / "robot-data-studio/config/camera_profiles"
+    profile = _load_camera_profile(root / "isaac_fr3_dual_wrist_v1.json", width=960, height=720)
+    specs = _fr3_wrist_camera_specs(profile, {"left": {"prim_path": "/World/Franka"}, "right": {"prim_path": "/World/FrankaRight"}})
+    assert [spec[2] for spec in specs[2:]] == ["/World/Franka/fr3_hand/side_camera", "/World/FrankaRight/fr3_hand/wrist_camera"]
+    assert all(spec[3] is None for spec in specs[:2])
+    for spec in specs[2:]:
+        mount = spec[3]
+        assert mount["convention"] == "ros"
+        assert math.isclose(sum(v*v for v in mount["rotation_parent_xyzw"]), 1, abs_tol=2e-6)
+        # Local IsaacLab 6 uses xyzw; the scalar from LeHome wxyz is last.
+        assert mount["rotation_parent_xyzw"][-1] > .97
+    frames = {name: object() for name in CAMERA_NAMES}
+    saved = _recording_images(frames, _recording_camera_map(profile))
+    assert list(saved) == ["main", "left_wrist", "right_wrist"]
+    assert saved["left_wrist"] is frames["side"] and saved["right_wrist"] is frames["wrist"]
+    assert frames["top"] not in saved.values()
+    legacy = _load_camera_profile(root / "isaac_bimanual_tabletop_visual_v5.json", width=960, height=720)
+    assert _recording_images(frames, _recording_camera_map(legacy)) == frames
+
+
+def test_runtime_publishes_wrist_roles_and_recording_map():
+    import json
+    from gello_remote.isaaclab_gello import _recording_camera_map
+    path = Path(__file__).resolve().parents[2] / "robot-data-studio/config/camera_profiles/isaac_fr3_dual_wrist_v1.json"
+    profile = _load_camera_profile(path, width=960, height=720)
+    server = GelloWebServer(SimpleNamespace(status=lambda: {"joint_targets": [0.]*7}), TelemetryStore(),
+        host="127.0.0.1", port=18081,
+        camera_labels=profile["engine_overrides"]["isaac_sim"]["preview_labels"],
+        recording_camera_map=_recording_camera_map(profile))
+    response = server._process_request(SimpleNamespace(protocol=LegacyProtocol()),
+        SimpleNamespace(path="/teleop-config.json", headers={}))
+    payload = json.loads(response.body)
+    assert payload["camera_labels"]["side"] == "Left wrist"
+    assert payload["camera_labels"]["wrist"] == "Right wrist"
+    assert "top" not in payload["recording_camera_map"].values()

@@ -85,3 +85,17 @@ def test_isaaclab_backend_uses_ordered_arm_and_finger_joints(monkeypatch: pytest
     assert full_calls == [((1, 2), 0.0, "float32", "cuda:3")]
     assert articulation.target_calls == [("tensor", list(range(7))), ("fingers", [7, 8])]
     assert articulation.writes == 1
+
+
+def test_fr3_backend_uses_fr3_joint_names_without_panda_substitution(monkeypatch):
+    fake_torch=SimpleNamespace()
+    monkeypatch.setitem(__import__("sys").modules,"torch",fake_torch)
+    seen=[]
+    class FR3:
+        def find_joints(self,names,*,preserve_order):
+            seen.append(names)
+            if isinstance(names,list):return list(range(7)),names
+            assert names=="fr3_finger_joint.*"
+            return [7,8],["fr3_finger_joint1","fr3_finger_joint2"]
+    IsaacLabFrankaBackend(FR3(),device="cpu",robot_model="fr3")
+    assert seen[0] == [f"fr3_joint{i}" for i in range(1,8)]

@@ -124,6 +124,15 @@
           <div id="raw" class="raw-values">Raw ID 1–8: waiting</div>
         </section>
 
+        <section id="right-gello-panel" class="panel-section" data-control-source="gello" hidden>
+          <h2>Right GELLO</h2>
+          <p>Select the second USB explicitly. Both arms hold when either stream expires.</p>
+          <div class="button-row"><button id="right-connect">Connect right USB</button><button id="right-disconnect">Disconnect right</button></div>
+          <div class="button-grid"><button id="right-home">Capture right robot home</button><button id="right-open">Capture right gripper open</button><button id="right-closed">Capture right gripper closed</button></div>
+          <div class="directions"><label>J1 <select data-right-direction><option value="1">+1</option><option value="-1">−1</option></select></label><label>J2 <select data-right-direction><option value="1">+1</option><option value="-1">−1</option></select></label><label>J3 <select data-right-direction><option value="1">+1</option><option value="-1">−1</option></select></label><label>J4 <select data-right-direction><option value="1">+1</option><option value="-1">−1</option></select></label><label>J5 <select data-right-direction><option value="1">+1</option><option value="-1">−1</option></select></label><label>J6 <select data-right-direction><option value="1">+1</option><option value="-1">−1</option></select></label><label>J7 <select data-right-direction><option value="1">+1</option><option value="-1">−1</option></select></label></div>
+          <div id="right-status" class="status-text">Right USB disconnected. Default57600 baud /20Hz; no EEPROM writes.</div>
+        </section>
+
         <section class="panel-section" data-control-source="keyboard" hidden>
           <h1>Keyboard → Franka</h1>
           <p>Isaac Lab Se3Keyboard semantics: relative end-effector pose through damped least-squares IK.</p>

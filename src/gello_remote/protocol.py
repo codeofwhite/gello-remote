@@ -28,6 +28,7 @@ class GelloCommandV1(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     type: Literal["gello"] = "gello"
+    arm: Literal["left", "right"] | None = None
     version: Literal[1] = 1
     session_id: str = Field(default="legacy", min_length=1, max_length=128)
     sequence: int = Field(ge=0)

@@ -14,7 +14,7 @@ import {
 } from "@nvidia/omniverse-webrtc-streaming-library";
 
 import {
-  GelloSerialReader,
+  DualGelloBridge,
   classifyGripper,
   mapJointPositions,
 } from "../../src/gello_remote/web/gello_web_serial.mjs";
@@ -82,15 +82,24 @@ async function connectStream() {
     dualArm = runtimeConfig.dual_arm === true;
     byId("arm-switch-help").hidden = !dualArm;
     if (dualArm) {
-      for (const [name, label] of [["side", "Left oblique"], ["wrist", "Right oblique"]]) {
+      const labels = { side: "Left oblique", wrist: "Right oblique", ...runtimeConfig.camera_labels };
+      for (const [name, label] of Object.entries(labels) as [string, string][]) {
         const card = document.querySelector<HTMLElement>(`[data-preview-camera="${name}"]`);
         const heading = card?.querySelector("strong");
         if (heading) heading.textContent = label;
         card?.setAttribute("aria-label", `Show ${label} camera in main view`);
-        byId<HTMLImageElement>(`${name}-preview-image`).alt = `${label} external camera`;
+        byId<HTMLImageElement>(`${name}-preview-image`).alt = `${label} camera`;
       }
     }
     configureControlSource(runtimeConfig.control_source, runtimeConfig.control_hz);
+    robotHomes = runtimeConfig.robot_homes ?? {};
+    byId("right-gello-panel").hidden = !dualArm || controlSource !== "gello";
+    if (dualArm) connectButton.textContent = "Connect LEFT GELLO";
+    if (runtimeConfig.local_display) {
+      streamEndpoint.textContent = "Local simulator window; WebRTC disabled";
+      setStreamState("connecting", "Use the local Isaac Sim window", "USB controls and recording remain available here. Preview images are auxiliary.");
+      return;
+    }
     const endpoint = resolveStreamConfig(runtimeConfig, window.location.search);
     streamEndpoint.textContent = `WebRTC: ${endpoint.signalingServer}:${endpoint.signalingPort} / UDP ${endpoint.mediaPort}`;
     setStreamState(
@@ -255,6 +264,8 @@ function markPreviewsWaiting(detail: string) {
 
 let socket: WebSocket | undefined;
 let rawSample: number[] | null = null;
+let robotHomes: Record<string, number[]> = {};
+let mappedRobotHome: number[] | undefined;
 let armZero: number[] | null = null;
 let gripperOpen: number | null = null;
 let gripperClosed: number | null = null;
@@ -274,7 +285,7 @@ function newGelloSessionId() {
 }
 
 function calibrationReady() {
-  return armZero !== null && gripperOpen !== null && gripperClosed !== null && gripperOpen !== gripperClosed;
+  return mappedRobotHome?.length === 7 && armZero !== null && gripperOpen !== null && gripperClosed !== null && gripperOpen !== gripperClosed;
 }
 
 function stopControl() {
@@ -364,7 +375,7 @@ function updateButtons() {
   captureHomeButton.disabled = !hasSample;
   captureOpenButton.disabled = !hasSample;
   captureClosedButton.disabled = !hasSample;
-  enableControl.disabled = !calibrationReady();
+  enableControl.disabled = !calibrationReady() || (dualArm && !rightReady());
 }
 
 function serialStatus({ level, message, connected }: { level: string; message: string; connected?: boolean }) {
@@ -387,14 +398,16 @@ function handleSample(raw: number[]) {
   updateButtons();
   if (!enableControl.checked || !calibrationReady() || socket?.readyState !== WebSocket.OPEN) return;
   try {
+    if (socket.bufferedAmount > 4096) { stopControl(); throw new Error("Control transport backed up; motion disabled"); }
     const directions = directionElements.map((element) => Number(element.value));
     socket.send(JSON.stringify({
       type: "gello",
       version: 1,
+      ...(dualArm ? { arm: "left" } : {}),
       session_id: sessionId,
       sequence: sequence++,
       timestamp_ns: Date.now() * 1e6,
-      joint_targets: mapJointPositions(raw, armZero, directions),
+      joint_targets: mapJointPositions(raw, armZero, directions, mappedRobotHome),
       gripper_closed: classifyGripper(raw[7], gripperOpen, gripperClosed),
     }));
   } catch (error) {
@@ -402,7 +415,45 @@ function handleSample(raw: number[]) {
   }
 }
 
-const reader = new GelloSerialReader({ onSample: handleSample, onStatus: serialStatus });
+type RightCalibration = { raw: number[] | null; zero: number[] | null; home?: number[]; open: number | null; closed: number | null };
+const rightCalibration: RightCalibration = { raw: null, zero: null, open: null, closed: null };
+const rightStatus = byId<HTMLDivElement>("right-status");
+function rightReady() {
+  return rightCalibration.zero !== null && rightCalibration.home?.length === 7 && rightCalibration.open !== null && rightCalibration.closed !== null && rightCalibration.open !== rightCalibration.closed;
+}
+const bridge = new DualGelloBridge({
+  onSample: (arm: string, raw: number[]) => {
+    if (arm === "left") { handleSample(raw); return; }
+    rightCalibration.raw = [...raw]; updateButtons();
+    if (!dualArm || !enableControl.checked || !calibrationReady() || !rightReady() || socket?.readyState !== WebSocket.OPEN) return;
+    try {
+      if (socket.bufferedAmount > 4096) throw new Error("Control transport backed up");
+      socket.send(JSON.stringify({type: "gello", version: 1, arm: "right", session_id: sessionId,
+        sequence: sequence++, timestamp_ns: Date.now()*1e6,
+        joint_targets: mapJointPositions(raw, rightCalibration.zero, [...document.querySelectorAll<HTMLSelectElement>("[data-right-direction]")].map(x=>Number(x.value)), rightCalibration.home),
+        gripper_closed: classifyGripper(raw[7], rightCalibration.open, rightCalibration.closed)}));
+    } catch(error) { stopControl(); rightStatus.textContent=String(error); }
+  },
+  onStatus: (arm: string, status: {level: string; message: string; connected?: boolean}) => {
+    if (arm === "left") serialStatus(status);
+    else {rightStatus.textContent=status.message; if (status.level === "error" || status.connected === false) stopControl();}
+  },
+});
+const reader = bridge.reader("left");
+byId<HTMLButtonElement>("right-connect").onclick = async () => {
+  stopControl(); rightCalibration.raw=null; rightCalibration.zero=null; rightCalibration.open=null; rightCalibration.closed=null;
+  try {await bridge.connect("right");} catch(error) {rightStatus.textContent=String(error);}
+};
+byId<HTMLButtonElement>("right-disconnect").onclick = async () => {stopControl(); await bridge.disconnect("right"); rightCalibration.raw=null; updateButtons();};
+byId<HTMLButtonElement>("right-home").onclick = () => {
+  if (!rightCalibration.raw || robotHomes.right?.length !== 7) return;
+  stopControl(); rightCalibration.zero=rightCalibration.raw.slice(0,7); rightCalibration.home=[...robotHomes.right];
+  rightStatus.textContent="Right robot home captured; verify all joint directions."; updateButtons();
+};
+for (const kind of ["open", "closed"] as const) byId<HTMLButtonElement>(`right-${kind}`).onclick=()=>{
+  if (!rightCalibration.raw) return; stopControl(); rightCalibration[kind]=rightCalibration.raw[7];
+  rightStatus.textContent=`Right gripper ${kind} captured.`; updateButtons();
+};
 
 connectButton.onclick = async () => {
   stopControl();
@@ -429,6 +480,9 @@ disconnectButton.onclick = async () => {
 
 captureHomeButton.onclick = () => {
   if (!rawSample) return;
+  if (robotHomes.left?.length !== 7) { serialStatus({level:"error", message:"No measured robot home available"}); return; }
+  stopControl();
+  mappedRobotHome = [...robotHomes.left];
   armZero = rawSample.slice(0, 7);
   serialStatus({ level: "ok", message: "Arm home captured; verify directions before enabling control." });
   updateButtons();
@@ -446,7 +500,7 @@ captureClosedButton.onclick = () => {
   updateButtons();
 };
 enableControl.onchange = () => {
-  if (enableControl.checked && !calibrationReady()) {
+  if (enableControl.checked && (!calibrationReady() || (dualArm && !rightReady()))) {
     stopControl();
     serialStatus({ level: "error", message: "Capture arm home and both gripper endpoints first." });
   } else if (enableControl.checked) {
@@ -458,6 +512,8 @@ enableControl.onchange = () => {
 
 function updateTelemetry(message: any) {
   const control = message.control ?? message.gello;
+  if (message.actual_joint_positions?.length === 7) robotHomes.left=[...message.actual_joint_positions];
+  if (message.right_actual_joint_positions?.length === 7) robotHomes.right=[...message.right_actual_joint_positions];
   const previews = message.previews ?? {};
   if (control?.dual_arm && control.active_arm &&
       (!keyboardSynchronized || (!pressedKeyboardKeys.size && control.sequence === keyboardSequence - 1))) {
@@ -477,7 +533,8 @@ function updateTelemetry(message: any) {
   }
   const previewLagged = previews.encoded > 5 && previews.actual_fps < previews.target_fps * 0.8;
   simStatusElement.textContent = `Simulator: ${message.sim_ready ? "ready" : "starting"} | source: ${message.control_source ?? "gello"} | sequence: ${control.sequence ?? "–"} | age: ${control.age_ms ?? "–"} ms | watchdog: ${control.watchdog_holding ? "HOLD" : "fresh"} | holds: ${control.watchdog_holds}`;
-  simStatusElement.className = `status-text ${control.watchdog_holding || previewLagged ? "warning" : "ok"}`;
+  if (dualArm && controlSource === "gello") simStatusElement.textContent = ["left", "right"].map(arm => `${arm}: age ${control[arm]?.age_ms ?? "–"}ms, receive→tick p95 ${control[arm]?.receive_to_tick_ms_p95?.toFixed(1) ?? "–"}ms`).join(" | ")+` | coupled hold: ${Boolean(control.coupled_hold)}`;
+  simStatusElement.className = `status-text ${control.watchdog_holding || control.coupled_hold || previewLagged ? "warning" : "ok"}`;
   const fingers = message.finger_positions?.map((value: number) => Number(value).toFixed(4)).join(", ") ?? "–";
   const surface = message.work_surface_top_m == null ? "–" : Number(message.work_surface_top_m).toFixed(3);
   const tcp = message.tcp_z_m == null ? "–" : Number(message.tcp_z_m).toFixed(3);

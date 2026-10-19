@@ -97,3 +97,6 @@ test("dual bridge rejects an unknown arm instead of guessing", () => {
   assert.throws(() => bridge.reader("both"), /unknown arm: both/);
   assert.throws(() => bridge.isConnected("both"), /unknown arm: both/);
 });
+
+// Calibration uses each simulated arm's captured home, not a shared Panda home.
+assert.deepEqual(mapJointPositions([100,100,100,100,100,100,100], [100,100,100,100,100,100,100], [1,1,1,1,1,1,1], [.1,.2,.3,.4,.5,.6,.7]), [.1,.2,.3,.4,.5,.6,.7]);

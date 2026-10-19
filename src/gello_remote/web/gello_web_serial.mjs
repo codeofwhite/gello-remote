@@ -144,11 +144,12 @@ export function parseStatusPosition(packet) {
   return { id: packet.id, position };
 }
 
-export function mapJointPositions(rawPositions, zeroPositions, directions) {
+export function mapJointPositions(rawPositions, zeroPositions, directions, homePositions = FRANKA_HOME) {
   if (rawPositions.length < 7 || zeroPositions.length !== 7 || directions.length !== 7) {
     throw new Error("Joint mapping requires seven raw, zero, and direction values");
   }
-  return FRANKA_HOME.map((home, index) => {
+  if (homePositions.length !== 7 || !homePositions.every(Number.isFinite)) throw new Error("Seven finite robot home positions required");
+  return homePositions.map((home, index) => {
     const direction = Number(directions[index]);
     if (direction !== -1 && direction !== 1) throw new Error(`Joint ${index + 1} direction must be -1 or 1`);
     const raw = Number(rawPositions[index]);

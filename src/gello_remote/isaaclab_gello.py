@@ -34,11 +34,11 @@ from robot_data_contracts import (
 from .backends import FRANKA_GRIPPER_CLOSED_M, IsaacLabFrankaBackend
 from .control import FRANKA_HOME, GelloCommandController, GelloSessionGate
 from .protocol import GelloCommand
-from .isaac_bimanual_control import BimanualKeyboardState, keyboard_ik_targets
+from .isaac_bimanual_control import BimanualKeyboardState, BimanualGelloState, keyboard_ik_targets, fr3_writer_options
 
 
 WEB_ROOT = Path(__file__).with_name("web")
-WEB_CONSOLE_ROOT = WEB_ROOT / "console"
+WEB_CONSOLE_ROOT = Path(os.environ.get("GELLO_WEB_CONSOLE_ROOT", str(WEB_ROOT / "console")))
 STREAM_CAMERA_EYE = (2.2, 1.6, 1.7)
 STREAM_CAMERA_TARGET = (0.45, 0.0, 0.65)
 STREAM_WIDTH = 960
@@ -1196,6 +1196,31 @@ def _scene_camera_overrides(
     return overrides
 
 
+FR3_WRIST_PROFILE = "isaac_fr3_dual_wrist_v1"
+
+
+def _recording_camera_map(profile: dict[str, Any]) -> dict[str, str]:
+    """Dataset names are separate from the four stable preview wire IDs."""
+    if profile["id"] == FR3_WRIST_PROFILE:
+        return dict(profile["engine_overrides"]["isaac_sim"]["recording_camera_map"])
+    return {name: name for name in CAMERA_NAMES}
+
+
+def _recording_images(images: dict[str, Any], mapping: dict[str, str]) -> dict[str, Any]:
+    return {name: images[source] for name, source in mapping.items()}
+
+
+def _fr3_wrist_camera_specs(profile: dict[str, Any], robot_layout: dict[str, Any]):
+    """Resolve actual hand parents; only fixed cameras receive world look-at poses."""
+    overrides = profile["engine_overrides"]["isaac_sim"]
+    specs = [(name, "agentview", f"/World/RecordCamera_{name}", None) for name in ("base", "top")]
+    for name in ("side", "wrist"):
+        mount = overrides[name]
+        parent = robot_layout[mount["arm"]]["prim_path"] + "/" + mount["parent_link"]
+        specs.append((name, "wrist", parent + "/" + name + "_camera", mount))
+    return tuple(specs)
+
+
 def _load_camera_profile(path: Path | None, *, width: int, height: int) -> dict[str, Any]:
     """Load the import-safe camera profile before the Isaac application starts."""
     if path is None:
@@ -1861,6 +1886,10 @@ class GelloWebServer:
         keyboard: BrowserSe3KeyboardState | None = None,
         *,
         control_source: str = "gello",
+        dual_gello: BimanualGelloState | None = None,
+        local_display: bool = False,
+        camera_labels: dict[str, str] | None = None,
+        recording_camera_map: dict[str, str] | None = None,
         host: str,
         port: int,
         stream_host: str = "",
@@ -1874,6 +1903,10 @@ class GelloWebServer:
         if control_source == "keyboard" and keyboard is None:
             raise ValueError("keyboard control requires BrowserSe3KeyboardState")
         self._controller = controller
+        self._dual_gello = dual_gello
+        self._local_display = local_display
+        self._camera_labels = camera_labels or {}
+        self._recording_camera_map = recording_camera_map or {name: name for name in CAMERA_NAMES}
         self._keyboard = keyboard
         self._control_source = control_source
         self._telemetry = telemetry
@@ -1912,6 +1945,7 @@ class GelloWebServer:
         selected_status = (
             self._keyboard.status()
             if self._control_source == "keyboard" and self._keyboard is not None
+            else self._dual_gello.status() if self._dual_gello is not None
             else self._controller.status()
         )
         payload = {
@@ -1960,7 +1994,12 @@ class GelloWebServer:
                         if self._control_source != "gello":
                             raise ValueError("GELLO commands are disabled in keyboard mode")
                         command = GelloCommand.model_validate(data)
-                        accepted = self._controller.submit(command)
+                        if self._dual_gello is not None:
+                            accepted = self._dual_gello.submit(command)
+                        else:
+                            if command.arm is not None:
+                                raise ValueError("single GELLO does not accept an arm selector")
+                            accepted = self._controller.submit(command)
                         if accepted:
                             bound_control_session_id = command.session_id
                         log = (
@@ -2006,7 +2045,10 @@ class GelloWebServer:
                 if self._control_source == "keyboard" and self._keyboard is not None:
                     self._keyboard.release_session(bound_control_session_id)
                 else:
-                    self._controller.release_session(bound_control_session_id)
+                    if self._dual_gello is not None:
+                        self._dual_gello.release_session(bound_control_session_id)
+                    else:
+                        self._controller.release_session(bound_control_session_id)
 
     def _process_request(self, connection, request):
         if "Upgrade" in request.headers:
@@ -2029,7 +2071,12 @@ class GelloWebServer:
                         "fps": self._stream_fps,
                         "control_source": self._control_source,
                         "control_hz": self._control_hz,
-                        "dual_arm": isinstance(self._keyboard, BimanualKeyboardState),
+                        "dual_arm": isinstance(self._keyboard, BimanualKeyboardState) or self._dual_gello is not None,
+                        "local_display": self._local_display,
+                        "camera_labels": self._camera_labels,
+                        "recording_camera_map": self._recording_camera_map,
+                        "robot_homes": ({side: self._dual_gello.status()[side]["joint_targets"] for side in ("left", "right")}
+                            if self._dual_gello is not None else {"left": self._controller.status()["joint_targets"]}),
                     }
                 ),
             )
@@ -2308,7 +2355,13 @@ def _parse_args() -> tuple[argparse.Namespace, object]:
         help="versioned HDRI file; required for either USD visual style",
     )
     AppLauncher.add_app_launcher_args(parser)
+    parser.add_argument("--robot-model", choices=("panda", "fr3"), default="panda")
+    parser.add_argument("--local-display", action="store_true", help="Use the local simulator window; no WebRTC connection")
     args = parser.parse_args()
+    if args.local_display and (args.headless or args.livestream):
+        parser.error("--local-display requires a window and --livestream 0")
+    if args.robot_model == "fr3" and (not args.franka_usd or args.physics_backend != "physx" or args.scene not in {"bimanual_tabletop_v17", "bimanual_tabletop_v17_cloth", "bimanual_tabletop_v17_clothforge"}):
+        parser.error("FR3 requires an explicit FR3 USD and a PhysX bimanual v17 scene")
     from robot_data_contracts.usd_surface import validate_environment
     try:
         validate_environment(args.environment_appearance)
@@ -2359,8 +2412,8 @@ def _parse_args() -> tuple[argparse.Namespace, object]:
         if args.visual_style != "dual_franka_tabletop":
             parser.error("clothforge_free_drop reuses the v17 workstation visual style")
     elif args.scene in {"bimanual_tabletop_v17", "bimanual_tabletop_v17_cloth", "bimanual_tabletop_v17_clothforge"}:
-        if args.control_source != "keyboard":
-            parser.error("bimanual_tabletop_v17 requires keyboard control")
+        if args.control_source not in {"keyboard", "gello"}:
+            parser.error("bimanual_tabletop_v17 requires keyboard or dual GELLO control")
         if args.physics_backend != "physx" and args.scene != "bimanual_tabletop_v17_clothforge":
             parser.error("this bimanual scene requires PhysX")
         if args.visual_style != "dual_franka_tabletop":
@@ -2482,6 +2535,10 @@ def _parse_args() -> tuple[argparse.Namespace, object]:
         args.camera_profile = _load_camera_profile(
             args.camera_profile_file, width=args.width, height=args.height
         )
+        if args.camera_profile["id"] == FR3_WRIST_PROFILE and (
+            args.robot_model != "fr3" or args.scene not in {"bimanual_tabletop_v17", "bimanual_tabletop_v17_cloth", "bimanual_tabletop_v17_clothforge"} or args.physics_backend != "physx"
+        ):
+            raise ValueError("FR3 wrist cameras require a live bimanual FR3 PhysX scene")
     except (OSError, json.JSONDecodeError, ValueError) as exc:
         parser.error(str(exc))
     try:
@@ -2994,6 +3051,15 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
         cfg = FRANKA_PANDA_HIGH_PD_CFG.replace(prim_path=prim_path)
         if args.franka_usd:
             cfg.spawn.usd_path = args.franka_usd
+        if args.robot_model == "fr3":
+            cfg.init_state.joint_pos = {}
+            cfg.actuators = {name: actuator.copy() for name, actuator in cfg.actuators.items()}
+            for actuator in cfg.actuators.values():
+                actuator.joint_names_expr = [name.replace("panda_", "fr3_") for name in actuator.joint_names_expr]
+                for field in ("stiffness", "damping", "effort_limit", "velocity_limit", "effort_limit_sim", "velocity_limit_sim"):
+                    value = getattr(actuator, field, None)
+                    if isinstance(value, dict):
+                        setattr(actuator, field, {name.replace("panda_", "fr3_"): gain for name, gain in value.items()})
         joint_positions = (
             tuple(layout.get("joint_positions_rad", FRANKA_HOME))
             if layout is not None
@@ -3002,8 +3068,8 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
         if len(joint_positions) != 7:
             raise ValueError("static Franka layout must provide seven joint positions")
         for index, value in enumerate(joint_positions, start=1):
-            cfg.init_state.joint_pos[f"panda_joint{index}"] = value
-        cfg.init_state.joint_pos["panda_finger_joint.*"] = 0.04
+            cfg.init_state.joint_pos[f"{args.robot_model}_joint{index}"] = value
+        cfg.init_state.joint_pos[f"{args.robot_model}_finger_joint.*"] = 0.04
         if layout is not None:
             cfg.init_state.pos = tuple(layout["base_position_world_m"])
             cfg.init_state.rot = _layout_orientation_xyzw(layout)
@@ -3089,6 +3155,7 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
             file=sys.__stderr__,
             flush=True,
         )
+    recording_camera_map = _recording_camera_map(args.camera_profile)
     record_cameras: dict[str, object] = {}
     camera_prim_paths: dict[str, str] = {}
     camera_intrinsic_sources: dict[str, str] = {}
@@ -3122,7 +3189,14 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                 scene_geometry["stream_camera_eye_m"]
             )
         camera_sensor_fps = max(args.dataset_fps, args.preview_fps)
-        if live_bimanual:
+        if live_bimanual and profile["id"] == FR3_WRIST_PROFILE:
+            camera_specs = tuple(
+                (name, role, path, None if mount is None else CameraCfg.OffsetCfg(
+                    pos=tuple(mount["position_parent_m"]),
+                    rot=tuple(mount["rotation_parent_xyzw"]), convention=mount["convention"]))
+                for name, role, path, mount in _fr3_wrist_camera_specs(profile, robot_layout)
+            )
+        elif live_bimanual:
             isaac_overrides["side"] = dict(isaac_overrides["left"])
             isaac_overrides["wrist"] = dict(isaac_overrides["right"])
             camera_specs = tuple(
@@ -3219,7 +3293,7 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
             for side, robot_asset in (("left", robot), ("right", robot_right)):
                 assert robot_asset is not None
                 arm_ids = robot_asset.find_joints(
-                    [f"panda_joint{index}" for index in range(1, 8)],
+                    [f"{args.robot_model}_joint{index}" for index in range(1, 8)],
                     preserve_order=True,
                 )[0]
                 joint_positions = robot_asset.data.default_joint_pos.torch.clone()
@@ -3352,7 +3426,7 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
         args.visual_mount_validation = _validate_bimanual_mount_bounds(
             args.visual_asset["composition"],
             mesh_bounds(args.visual_asset["composition"]["table_prim_path"]),
-            {side: mesh_bounds(robot_layout[side]["prim_path"] + "/panda_link0") for side in ("left", "right")},
+            {side: mesh_bounds(robot_layout[side]["prim_path"] + f"/{args.robot_model}_link0") for side in ("left", "right")},
         )
         print("BIMANUAL_MOUNT_VALIDATED " + json.dumps(args.visual_mount_validation), flush=True)
     if dual_franka_tabletop:
@@ -3386,7 +3460,7 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                 float(value) for value in actual_pose
             ]
             arm_ids = robot_asset.find_joints(
-                [f"panda_joint{index}" for index in range(1, 8)],
+                [f"{args.robot_model}_joint{index}" for index in range(1, 8)],
                 preserve_order=True,
             )[0]
             actual_joints = (
@@ -3410,7 +3484,7 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
             args.visual_robot_layout[side]["actual_joint_positions_rad"] = [
                 float(value) for value in actual_joints
             ]
-            hand_index = robot_asset.find_bodies("panda_hand")[0][0]
+            hand_index = robot_asset.find_bodies(f"{args.robot_model}_hand")[0][0]
             args.visual_robot_layout[side]["actual_hand_position_world_m"] = [
                 float(value)
                 for value in (
@@ -3422,7 +3496,8 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
             ]
     if record_cameras:
         posed_names = (
-            CAMERA_NAMES if live_bimanual else BIMANUAL_VISUAL_CAMERA_NAMES[:]
+            (("base", "top") if args.camera_profile["id"] == FR3_WRIST_PROFILE else CAMERA_NAMES)
+            if live_bimanual else BIMANUAL_VISUAL_CAMERA_NAMES[:]
             if dual_franka_tabletop
             else ("base", "top", "side")
         )
@@ -3495,7 +3570,7 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
         _pump_kit_frame(simulation_app)
         print(f"ISAAC_SCENE_READY {json.dumps(scene_status, sort_keys=True)}", file=sys.__stderr__, flush=True)
 
-    backend = IsaacLabFrankaBackend(robot, device=sim.device)
+    backend = IsaacLabFrankaBackend(robot, device=sim.device, robot_model=args.robot_model)
     initial_joint_positions = backend.current_joint_positions()
     controller = GelloCommandController(
         initial_joint_positions,
@@ -3504,13 +3579,14 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
         max_joint_speed=args.max_joint_speed,
         watchdog_timeout=args.gello_timeout,
     )
-    backend_right = IsaacLabFrankaBackend(robot_right, device=sim.device) if live_bimanual else None
+    backend_right = IsaacLabFrankaBackend(robot_right, device=sim.device, robot_model=args.robot_model) if live_bimanual else None
     initial_right_positions = backend_right.current_joint_positions() if backend_right else None
     controller_right = GelloCommandController(
         initial_right_positions, backend_right.joint_position_limits(),
         control_hz=args.control_hz, max_joint_speed=args.max_joint_speed,
         watchdog_timeout=args.gello_timeout,
     ) if backend_right else None
+    dual_gello = BimanualGelloState(controller, controller_right, watchdog_timeout=args.gello_timeout) if live_bimanual and args.control_source == "gello" else None
     keyboard_factory = (
         lambda **kwargs: BimanualKeyboardState(BrowserSe3KeyboardState, **kwargs)
     ) if live_bimanual else BrowserSe3KeyboardState
@@ -3527,9 +3603,9 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
         device=sim.device,
     )
     arm_joint_ids = robot.find_joints(
-        [f"panda_joint{index}" for index in range(1, 8)], preserve_order=True
+        [f"{args.robot_model}_joint{index}" for index in range(1, 8)], preserve_order=True
     )[0]
-    hand_body_index = robot.find_bodies("panda_hand")[0][0]
+    hand_body_index = robot.find_bodies(f"{args.robot_model}_hand")[0][0]
     hand_jacobian_index = hand_body_index - 1 if robot.is_fixed_base else hand_body_index
     jacobian_joint_ids = [index + robot.num_base_dofs for index in arm_joint_ids]
 
@@ -3547,8 +3623,8 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                 from .isaac_clothforge import newton_hand_jacobian
                 from isaaclab.utils.math import quat_apply_inverse
                 selected_ik = diff_ik_right if arm == "right" else diff_ik_controller
-                ids = selected_robot.find_joints([f"panda_joint{i}" for i in range(1, 8)], preserve_order=True)[0]
-                hand_id = selected_robot.find_bodies("panda_hand")[0][0]
+                ids = selected_robot.find_joints([f"{args.robot_model}_joint{i}" for i in range(1, 8)], preserve_order=True)[0]
+                hand_id = selected_robot.find_bodies(f"{args.robot_model}_hand")[0][0]
                 root = selected_robot.data.root_pose_w.torch
                 hand = selected_robot.data.body_pose_w.torch[:, hand_id]
                 pos, quat = subtract_frame_transforms(root[:, :3], root[:, 3:7], hand[:, :3], hand[:, 3:7])
@@ -3567,7 +3643,7 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
             return keyboard_ik_targets(
                 selected_robot,
                 diff_ik_right if arm == "right" else diff_ik_controller,
-                sample, hold_targets, device=sim.device, world_axes=True,
+                sample, hold_targets, device=sim.device, world_axes=True, robot_model=args.robot_model,
             )
         if not any(sample.delta_pose):
             return hold_targets
@@ -3711,14 +3787,14 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
         except importlib.metadata.PackageNotFoundError:
             engine_version = "6.0.1"
         state_names = (
-            [f"joint_position/panda_joint{index}_rad" for index in range(1, 8)]
-            + ["joint_position/panda_finger_joint1_m", "joint_position/panda_finger_joint2_m"]
-            + [f"joint_velocity/panda_joint{index}_rad_s" for index in range(1, 8)]
-            + ["joint_velocity/panda_finger_joint1_m_s", "joint_velocity/panda_finger_joint2_m_s"]
+            [f"joint_position/{args.robot_model}_joint{index}_rad" for index in range(1, 8)]
+            + [f"joint_position/{args.robot_model}_finger_joint1_m", f"joint_position/{args.robot_model}_finger_joint2_m"]
+            + [f"joint_velocity/{args.robot_model}_joint{index}_rad_s" for index in range(1, 8)]
+            + [f"joint_velocity/{args.robot_model}_finger_joint1_m_s", f"joint_velocity/{args.robot_model}_finger_joint2_m_s"]
         )
-        action_names = [f"target_joint_position/panda_joint{index}_rad" for index in range(1, 8)] + [
-            "target_joint_position/panda_finger_joint1_m",
-            "target_joint_position/panda_finger_joint2_m",
+        action_names = [f"target_joint_position/{args.robot_model}_joint{index}_rad" for index in range(1, 8)] + [
+            f"target_joint_position/{args.robot_model}_finger_joint1_m",
+            f"target_joint_position/{args.robot_model}_finger_joint2_m",
         ]
         if live_bimanual:
             state_names = [f"{arm}/{name}" for arm in ("left", "right") for name in state_names]
@@ -3727,6 +3803,7 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
             "isaaclab_device": args.device,
             "gpu_id": args.gpu_id,
             "physics_hz": args.physics_hz,
+            "robot_model": args.robot_model,
             "physics_backend": args.physics_backend,
             "physics_solver": newton_solver if args.physics_backend == "newton" else "physx",
             "physics_substeps": newton_physics.num_substeps if newton_physics is not None else 1,
@@ -3744,7 +3821,7 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                     "gripper_closed",
                 ],
                 "gello_joint_targets": [
-                    *[f"panda_joint{index}_rad" for index in range(1, 8)],
+                    *[f"{args.robot_model}_joint{index}_rad" for index in range(1, 8)],
                     "gripper_closed",
                 ],
                 "retargeted_trajectory": [
@@ -3799,6 +3876,26 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                 ]},
             )
 
+        if args.camera_profile["id"] == FR3_WRIST_PROFILE:
+            preview_roles = {"base": "fixed main view", "top": "preview-only overhead",
+                             "side": "left fr3_hand mounted wrist", "wrist": "right fr3_hand mounted wrist"}
+            base_run_metadata.update(
+                preview_camera_roles=preview_roles,
+                recording_camera_map=recording_camera_map,
+                camera_roles={name: preview_roles[source] for name, source in recording_camera_map.items()},
+                camera_prim_paths={name: camera_prim_paths[source] for name, source in recording_camera_map.items()},
+                camera_intrinsic_sources={name: camera_intrinsic_sources[source] for name, source in recording_camera_map.items()},
+                camera_intrinsic_matrices={name: camera_intrinsic_matrices[source] for name, source in recording_camera_map.items()},
+                camera_extrinsics={name: (
+                    {**isaac_overrides[source], "transform_kind": "parent_relative_dynamic",
+                     "parent_prim": camera_prim_paths[source].rsplit("/", 1)[0]}
+                    if "position_parent_m" in isaac_overrides[source] else
+                    {**isaac_overrides[source],
+                     **getattr(args, "camera_lighting_applied", {}).get("cameras", {}).get(source, {}),
+                     "transform_kind": "world_fixed"})
+                    for name, source in recording_camera_map.items()},
+            )
+
         def make_episode_writer(
             *,
             control_source: str,
@@ -3815,6 +3912,7 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
             writer_class = DualFrankaEpisodeWriter if live_bimanual else FrankaEpisodeWriter
             return writer_class(
                 args.data_dir,
+                **(fr3_writer_options() if args.robot_model == "fr3" else {}),
                 fps=int(round(args.dataset_fps)),
                 engine_id="isaac_sim",
                 engine_version=engine_version,
@@ -3825,7 +3923,7 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                 state_names=state_names,
                 action_names=action_names,
                 operator_command_names=operator_command_names,
-                camera_names=list(CAMERA_NAMES),
+                camera_names=list(recording_camera_map),
                 run_metadata=run_metadata,
                 generation_method=generation_method,
                 lineage=lineage,
@@ -3846,7 +3944,7 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                         "model_target_gripper_closed_fraction",
                     ]
                     if args.control_source == "openpi"
-                    else [f"requested_joint_position/panda_joint{index}_rad" for index in range(1, 8)]
+                    else [f"requested_joint_position/{args.robot_model}_joint{index}_rad" for index in range(1, 8)]
                     + ["requested_gripper_closed"]
                 )
             )
@@ -4177,7 +4275,7 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                             for name, camera in record_cameras.items()
                         }
                         attempt_writer.add_frame(
-                            images=images,
+                            images=_recording_images(images, recording_camera_map),
                             state=state,
                             action=safe_native,
                             requested_action=requested_native,
@@ -4593,7 +4691,7 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                 object_velocity = task_object.data.root_vel_w.torch[0].detach().cpu().numpy()
                 latest_timing = inference_samples[-1]
                 writer.add_frame(
-                    images=images,
+                    images=_recording_images(images, recording_camera_map),
                     state=state,
                     action=safe_native,
                     requested_action=requested_native,
@@ -4742,6 +4840,10 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
         views,
         keyboard,
         control_source=args.control_source,
+        dual_gello=dual_gello,
+        local_display=args.local_display,
+        camera_labels=args.camera_profile["engine_overrides"]["isaac_sim"].get("preview_labels", {}),
+        recording_camera_map=recording_camera_map,
         host=args.host,
         port=args.port,
         stream_host=args.stream_host,
@@ -4755,7 +4857,7 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
     performance = RuntimePerformance(args.runtime_performance_report,
         lambda: torch.cuda.synchronize(sim.device) if str(sim.device).startswith("cuda") else None,
         args.runtime_performance_mode)
-    right_hand_body_index = robot_right.find_bodies("panda_hand")[0][0] if robot_right is not None else None
+    right_hand_body_index = robot_right.find_bodies(f"{args.robot_model}_hand")[0][0] if robot_right is not None else None
     physics_step = 0
     control_step = 0
     visual_frame_count = 0
@@ -4976,15 +5078,19 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                         )
                         last_keyboard_command = keyboard_command
                         telemetry.update(keyboard_applied_sequence=keyboard_sample.sequence)
-                safe_command = controller.tick(
-                    now=simulated_time if args.smoke_steps else None,
-                    force_hold=live_bimanual and (active_arm != "left" or keyboard_sample.watchdog_holding),
-                )
-                if controller_right is not None:
-                    safe_right = controller_right.tick(
+                if dual_gello is not None:
+                    pair = dual_gello.tick(now=simulated_time if args.smoke_steps else None)
+                    safe_command, safe_right = pair.left, pair.right
+                else:
+                    safe_command = controller.tick(
                         now=simulated_time if args.smoke_steps else None,
-                        force_hold=active_arm != "right" or keyboard_sample.watchdog_holding,
+                        force_hold=live_bimanual and (active_arm != "left" or keyboard_sample.watchdog_holding),
                     )
+                    if controller_right is not None:
+                        safe_right = controller_right.tick(
+                            now=simulated_time if args.smoke_steps else None,
+                            force_hold=active_arm != "right" or keyboard_sample.watchdog_holding,
+                        )
                 recording_active = writer is not None and writer.is_recording
                 dataset_due = (
                     recording_active
@@ -5073,12 +5179,26 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                         action = np.concatenate([action, np.asarray((*safe_right.joint_targets, right_finger_target, right_finger_target), np.float32)])
                         requested_action = np.concatenate([requested_action, np.asarray((*safe_right.requested_joint_targets, right_finger_target, right_finger_target), np.float32)])
                         inactive_operator = np.asarray((*([0.0] * 6), float(safe_right.gripper_closed if active_arm == "left" else safe_command.gripper_closed)), np.float32)
-                        operator_command = np.concatenate([operator_command, inactive_operator] if active_arm == "left" else [inactive_operator, operator_command])
+                        if args.control_source == "gello":
+                            operator_command = np.asarray((*safe_command.requested_joint_targets, float(safe_command.gripper_closed),
+                                *safe_right.requested_joint_targets, float(safe_right.gripper_closed)), np.float32)
+                        else:
+                            operator_command = np.concatenate([operator_command, inactive_operator] if active_arm == "left" else [inactive_operator, operator_command])
                         extra_arrays = {
-                            "dual_active_arm": np.asarray([0 if active_arm == "left" else 1], np.int8),
+                            "dual_active_arm": np.asarray([-1 if dual_gello is not None else (0 if active_arm == "left" else 1)], np.int8),
                             "left_ee_pose": robot.data.body_pose_w.torch[0, hand_body_index].detach().cpu().numpy(),
-                            "right_ee_pose": robot_right.data.body_pose_w.torch[0, robot_right.find_bodies("panda_hand")[0][0]].detach().cpu().numpy(),
+                            "right_ee_pose": robot_right.data.body_pose_w.torch[0, robot_right.find_bodies(f"{args.robot_model}_hand")[0][0]].detach().cpu().numpy(),
                         }
+                        if dual_gello is not None:
+                            extra_arrays.update(
+                                dual_coupled_hold=np.asarray([pair.coupled_hold], np.bool_),
+                                dual_control_sequence=np.asarray([sample.sequence if sample.sequence is not None else -1 for sample in (safe_command, safe_right)], np.int64),
+                                dual_control_source_timestamp_ns=np.asarray([sample.source_timestamp_ns if sample.source_timestamp_ns is not None else -1 for sample in (safe_command, safe_right)], np.int64),
+                                dual_control_receive_timestamp_ns=np.asarray([sample.receive_timestamp_ns if sample.receive_timestamp_ns is not None else -1 for sample in (safe_command, safe_right)], np.int64),
+                            )
+                    if dual_gello is not None and cloth_object is not None:
+                        extra_arrays["cloth_particles"] = cloth_object.data.nodal_pos_w.torch[0].detach().cpu().numpy().copy()
+                        extra_arrays["cloth_particle_velocities"] = cloth_object.data.nodal_vel_w.torch[0].detach().cpu().numpy().copy()
                     ee_pose = None
                     object_pose = None
                     object_velocity = None
@@ -5104,7 +5224,7 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                             safe_right.joint_targets, gripper_closed=safe_right.gripper_closed,
                         )
                     writer.add_frame(
-                        images=images,
+                        images=_recording_images(images, recording_camera_map),
                         state=state,
                         action=action,
                         requested_action=requested_action,
@@ -5250,7 +5370,7 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
             for side, robot_asset in (("left", robot), ("right", robot_right)):
                 assert robot_asset is not None
                 arm_ids = robot_asset.find_joints(
-                    [f"panda_joint{index}" for index in range(1, 8)],
+                    [f"{args.robot_model}_joint{index}" for index in range(1, 8)],
                     preserve_order=True,
                 )[0]
                 args.visual_robot_layout[side]["final_joint_positions_rad"] = [
@@ -5262,7 +5382,7 @@ def _run_simulator(args: argparse.Namespace, simulation_app: object) -> bool:
                         .tolist()
                     )
                 ]
-                hand_index = robot_asset.find_bodies("panda_hand")[0][0]
+                hand_index = robot_asset.find_bodies(f"{args.robot_model}_hand")[0][0]
                 args.visual_robot_layout[side]["final_hand_position_world_m"] = [
                     float(value)
                     for value in (
