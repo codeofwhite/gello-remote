@@ -5,3 +5,12 @@ __pycache__/
 .env
 checkpoints/
 data/
+
+# Private credentials and machine-local environment files
+.env.*
+!.env.example
+!.env.template
+*.pem
+*.key
+.secrets/
+credentials/
