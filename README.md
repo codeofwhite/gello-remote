@@ -1,8 +1,30 @@
 # GELLO Remote
 
-Local GELLO control client with a GPU inference service running on the remote
-8x RTX 5090 host. The first milestone deliberately uses a mock policy: validate
-transport and safety boundaries before connecting real robot actuation.
+Robot teleoperation and simulation workers, with a separate HTTP policy transport
+for inference integration. Control limits and stale-input handling stay with the
+worker or robot-side adapter; the policy service returns action suggestions.
+
+## Scope and branch status
+
+This README describes `local/gello-isaac-sim`. Branches contain different capabilities;
+check out the branch required by your deployment before following its examples.
+
+| Component | Entry point | Scope |
+| --- | --- | --- |
+| HTTP policy transport | `server.py`, `client.py`, `protocol.py` | Mock policy for transport and safety-boundary development |
+| Franka backend | `backends.py` | Mock backend; no physical robot adapter |
+| Isaac Lab diagnostic | `isaaclab_smoke.py` | Bounded simulated joint hold; requires a separate simulator runtime |
+| Genesis collection | `genesis_worker.py` | Loads the external ClothTwin plugin and shared data contracts |
+| Isaac collection and evaluation | `isaaclab_gello.py` | Keyboard/GELLO collection, configured trajectory and OpenPI modes |
+
+## Requirements and installation
+
+Python 3.10 or newer is required by the package. The HTTP service uses the
+`server` extra. Simulation additionally needs a compatible Isaac Lab / Isaac Sim
+or Genesis environment, external scene assets, and any shared-contract package
+used by the selected worker. Installing this package does not install a simulator.
+For browser GELLO input, use a desktop browser with Web Serial support and USB
+access on the computer running that browser.
 
 ## Local configuration
 
@@ -18,21 +40,21 @@ export SSH_TARGET="user@host.example"
 export PUBLIC_IP="203.0.113.10"
 ```
 
-## Remote server
+## HTTP transport quick start
 
 ```bash
-cd ${WORKSPACE}/gello-remote
+cd "${WORKSPACE}/gello-remote"
 python3 -m venv .venv
-.venv/bin/pip install -e '.[server]'
+.venv/bin/python -m pip install -e '.[server]'
 .venv/bin/uvicorn gello_remote.server:app --host 127.0.0.1 --port 8000
 ```
 
-## Local tunnel and smoke test
+## Connect through an SSH tunnel
 
 ```bash
 ssh -N -L 18000:127.0.0.1:8000 "${SSH_TARGET}"
 curl http://127.0.0.1:18000/health
-python -m gello_remote.client --url http://127.0.0.1:18000
+"${WORKSPACE}/gello-remote/.venv/bin/python" -m gello_remote.client --url http://127.0.0.1:18000
 ```
 
 The remote service returns suggestions only. Joint limits, velocity limits,
@@ -52,7 +74,7 @@ backend.set_joint_targets([0.0] * 7)
 ```
 
 An optional bounded Isaac Lab smoke test uses the installed Franka asset and
-the Isaac Lab 6.1.11 APIs. Isaac Lab imports are lazy, so ordinary imports and
+the compatible Isaac Lab APIs. Isaac Lab imports are lazy, so ordinary imports and
 unit tests do not require the simulator environment. Run it headlessly with:
 
 ```bash
@@ -168,7 +190,7 @@ simulator telemetry. Click `base`, `top`, `side`, or `wrist` (or press `1`–`4`
 to promote that camera to the high-frame-rate WebRTC viewport; press `0` to
 restore the free operator view. The WebRTC viewport defaults to 20 FPS via
 `--stream-fps`, leaving render capacity for the four 10 Hz dataset cameras.
-Explicitly choose COM3, place GELLO near the middle of its mechanical travel,
+Select the USB serial port belonging to your GELLO, place GELLO near the middle of its mechanical travel,
 capture the arm home and both gripper endpoints, set all seven joint
 directions, and only then enable control. Set `--gpu-id N` to the physical GPU
 index shown by `nvidia-smi`. The entry point exposes only that physical device
@@ -221,7 +243,7 @@ effector pose, object pose, and object velocity, and stores an independent
 
 Pass `--camera-profile-file /absolute/path/to/profile.json` to select the same
 sensor profile used by RoboData Studio. The lab profile models the active main
-D435i (`261722075807`) as `base` and the active wrist D435i (`261622075579`) as
+D435i as `base` and the wrist D435i as
 `wrist`; the historical third camera remains inventory-only. The wrist mount
 uses the Franka visuomotor reference pose pinned to the clean local IsaacLab
 checkout at `28a37cecdd433c22d9eabd6a5954add9f13a8951`. Until per-device 640x480 RGB
@@ -233,7 +255,28 @@ The `top` and `side` streams are explicitly marked virtual auxiliary views in
 the Isaac Sim profile. They improve XY and contact/height judgment without
 claiming that the lab owns two additional matching physical cameras.
 
-This milestone provides empty-scene diagnostics and a rigid pick-place
-collection scene. It does not yet control cloth, validate real COM3
-calibration, or send any command to a physical robot. GPU validation uses short
-simulated hold episodes; it is not evidence of successful task manipulation.
+The collection interfaces on this branch do not establish successful cloth
+manipulation or real-robot transfer. Verify the selected scene and action contract
+separately from transport and startup checks.
+
+
+## Verification and operating boundaries
+
+Run CPU-only transport and safety tests in an environment with the test extra:
+
+```bash
+cd "${WORKSPACE}/gello-remote"
+.venv/bin/python -m pip install -e '.[test,server]'
+PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q -p no:cacheprovider tests/test_protocol.py tests/test_control.py
+```
+
+Simulator tests may require additional external packages, scene assets, and a
+sibling Robot Data Studio checkout. Use the deployment's pinned versions rather
+than assuming that all branch combinations are compatible. Do not bypass joint
+limits, velocity limits, watchdogs, or emergency-stop enforcement. These software
+checks do not certify real-robot safety.
+
+Keep API credentials, robot calibration, private keys, and local machine settings
+outside version control. Configuration examples do not contain working credentials.
+Historical commits are retained; current-file cleanup does not remove old values
+from Git history.
