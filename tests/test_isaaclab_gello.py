@@ -1128,7 +1128,7 @@ def test_forward_bases_fit_rotated_mounts_with_rear_edge_clearance():
 
 
 def test_v5_camera_profile_keeps_original_views_and_nominal_calibration():
-    root = Path('/data/zhanghejun/robot-data-studio/config/camera_profiles')
+    root = Path(__file__).resolve().parents[2] / "robot-data-studio/config/camera_profiles"
     original = _load_camera_profile(root/'isaac_bimanual_tabletop_visual_v4.json', width=960, height=720)
     extended = _load_camera_profile(root/'isaac_bimanual_tabletop_visual_v5.json', width=960, height=720)
     assert extended['engine_overrides'] == original['engine_overrides']

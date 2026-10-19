@@ -4,10 +4,24 @@ Local GELLO control client with a GPU inference service running on the remote
 8x RTX 5090 host. The first milestone deliberately uses a mock policy: validate
 transport and safety boundaries before connecting real robot actuation.
 
+## Local configuration
+
+Set these example values for your own workspace and SSH host before using the
+commands below. The IP address is reserved for documentation; replace it with
+your reachable streaming address when livestreaming is needed. Keep credentials
+and machine-specific configuration outside Git.
+
+```bash
+export WORKSPACE="$HOME/robot-workspace"
+export ISAACLAB_ENV="$WORKSPACE/.venvs/isaaclab"
+export SSH_TARGET="user@host.example"
+export PUBLIC_IP="203.0.113.10"
+```
+
 ## Remote server
 
 ```bash
-cd /data/zhanghejun/gello-remote
+cd ${WORKSPACE}/gello-remote
 python3 -m venv .venv
 .venv/bin/pip install -e '.[server]'
 .venv/bin/uvicorn gello_remote.server:app --host 127.0.0.1 --port 8000
@@ -16,7 +30,7 @@ python3 -m venv .venv
 ## Local tunnel and smoke test
 
 ```bash
-ssh -N -L 18000:127.0.0.1:8000 zhanghejun@219.223.200.145
+ssh -N -L 18000:127.0.0.1:8000 "${SSH_TARGET}"
 curl http://127.0.0.1:18000/health
 python -m gello_remote.client --url http://127.0.0.1:18000
 ```
@@ -42,9 +56,9 @@ the Isaac Lab 6.1.11 APIs. Isaac Lab imports are lazy, so ordinary imports and
 unit tests do not require the simulator environment. Run it headlessly with:
 
 ```bash
-env CONDA_PREFIX=/home/zhanghejun/miniconda3/envs/isaaclab \
-  CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/data/zhanghejun/gello-remote/src \
-  /data/zhanghejun/IsaacLab/isaaclab.sh -p -m gello_remote.isaaclab_smoke \
+env CONDA_PREFIX=${ISAACLAB_ENV} \
+  CUDA_VISIBLE_DEVICES=0 PYTHONPATH=${WORKSPACE}/gello-remote/src \
+  ${WORKSPACE}/IsaacLab/isaaclab.sh -p -m gello_remote.isaaclab_smoke \
   --steps 10 --device cuda:0 --viz none
 ```
 
@@ -86,7 +100,7 @@ lift, hold, and release separately; grasp requires the closed gripper to move
 the cube at least 2 cm above its initial height.
 
 `--control-source trajectory` is the Isaac MimicGen-lite execution path for
-resolved plans from `/data/zhanghejun/robot-data-generation`. For each source it
+resolved plans from `${WORKSPACE}/robot-data-generation`. For each source it
 runs FK on the loaded Franka using the recorded `applied_action`, retargets the
 resulting `panda_hand` poses around the cube, and follows the 20 Hz waypoints
 through continuous absolute DLS IK and the existing joint safety limiter. Before
@@ -96,9 +110,9 @@ tracking-error, evaluator, and lineage evidence at 10 Hz. Start with the
 five-attempt nominal plan before the 100-attempt XY plan:
 
 ```bash
-env CONDA_PREFIX=/home/zhanghejun/miniconda3/envs/isaaclab \
-  PYTHONPATH=/data/zhanghejun/gello-remote/src:/data/zhanghejun/robot-data-generation/src:/data/zhanghejun/robot-data-studio/packages/robot-data-contracts/src \
-  /data/zhanghejun/IsaacLab/isaaclab.sh -p -m gello_remote.isaaclab_gello \
+env CONDA_PREFIX=${ISAACLAB_ENV} \
+  PYTHONPATH=${WORKSPACE}/gello-remote/src:${WORKSPACE}/robot-data-generation/src:${WORKSPACE}/robot-data-studio/packages/robot-data-contracts/src \
+  ${WORKSPACE}/IsaacLab/isaaclab.sh -p -m gello_remote.isaaclab_gello \
   --control-source trajectory --scene rigid_cube_lift --gpu-id 6 --enable_cameras \
   --control_hz 20 --dataset-fps 10 \
   --generation-plan /tmp/isaac_rigid_cube_lift_nominal_plan.json \
@@ -108,9 +122,9 @@ env CONDA_PREFIX=/home/zhanghejun/miniconda3/envs/isaaclab \
 Use `--resume-generation` only with the same plan and output directory.
 
 ```bash
-env CONDA_PREFIX=/home/zhanghejun/miniconda3/envs/isaaclab \
-  PYTHONPATH=/data/zhanghejun/gello-remote/src:/data/zhanghejun/openpi/packages/openpi-client/src:/data/zhanghejun/robot-data-studio/packages/robot-data-contracts/src \
-  /data/zhanghejun/IsaacLab/isaaclab.sh -p -m gello_remote.isaaclab_gello \
+env CONDA_PREFIX=${ISAACLAB_ENV} \
+  PYTHONPATH=${WORKSPACE}/gello-remote/src:${WORKSPACE}/openpi/packages/openpi-client/src:${WORKSPACE}/robot-data-studio/packages/robot-data-contracts/src \
+  ${WORKSPACE}/IsaacLab/isaaclab.sh -p -m gello_remote.isaaclab_gello \
   --control-source openpi --scene rigid_cube_lift --gpu-id 6 \
   --enable_cameras --rollout-count 20 --max-episode-frames 400 \
   --policy-checkpoint /absolute/path/to/checkpoint \
@@ -151,9 +165,9 @@ root. Keep that checkout untouched and explicitly select NVIDIA's published
 5.1 Franka asset:
 
 ```bash
-env CONDA_PREFIX=/home/zhanghejun/miniconda3/envs/isaaclab \
-  PYTHONPATH=/data/zhanghejun/gello-remote/src \
-  /data/zhanghejun/IsaacLab/isaaclab.sh -p -m gello_remote.isaaclab_gello \
+env CONDA_PREFIX=${ISAACLAB_ENV} \
+  PYTHONPATH=${WORKSPACE}/gello-remote/src \
+  ${WORKSPACE}/IsaacLab/isaaclab.sh -p -m gello_remote.isaaclab_gello \
   --gpu-id 0 --smoke_steps 240 \
   --franka-usd https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/Isaac/IsaacLab/Robots/FrankaEmika/panda_instanceable.usd
 ```
@@ -165,9 +179,9 @@ motion direction, arm tracking, finger tracking, and target-hold gates pass.
 Launch live control with:
 
 ```bash
-env CONDA_PREFIX=/home/zhanghejun/miniconda3/envs/isaaclab \
-  PYTHONPATH=/data/zhanghejun/gello-remote/src PUBLIC_IP=219.223.200.145 \
-  /data/zhanghejun/IsaacLab/isaaclab.sh -p -m gello_remote.isaaclab_gello \
+env CONDA_PREFIX=${ISAACLAB_ENV} \
+  PYTHONPATH=${WORKSPACE}/gello-remote/src PUBLIC_IP="${PUBLIC_IP}" \
+  ${WORKSPACE}/IsaacLab/isaaclab.sh -p -m gello_remote.isaaclab_gello \
   --gpu-id 6 --enable_cameras --livestream 1 --rendering_mode balanced \
   --scene rigid_pick_place --work-surface-height-m 0.25 \
   --host 127.0.0.1 --port 18081 \
@@ -179,7 +193,7 @@ Forward the control page to the Windows machine and open it in desktop Chrome
 or Edge:
 
 ```bash
-ssh -N -L 8080:127.0.0.1:18081 zhanghejun@219.223.200.145
+ssh -N -L 8080:127.0.0.1:18081 "${SSH_TARGET}"
 ```
 
 Open `http://localhost:8080`. The single page contains the Isaac Sim WebRTC
